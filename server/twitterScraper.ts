@@ -29,29 +29,130 @@ interface ScrapeResult {
   error?: string;
 }
 
+// 爬取速度配置
+export interface ScrapeConfig {
+  // 页面加载后的基础延迟（毫秒）
+  pageLoadDelay: number;
+  // 滚动间隔（毫秒）
+  scrollDelay: number;
+  // 推文间的延迟（毫秒）
+  betweenTweetsDelay: number;
+  // 是否启用随机延迟
+  randomDelay: boolean;
+  // 随机延迟范围（毫秒）
+  randomDelayRange: [number, number];
+}
+
+// 默认配置 - 保守模式，避免被封
+export const DEFAULT_SCRAPE_CONFIG: ScrapeConfig = {
+  pageLoadDelay: 3000,        // 页面加载后等待 3 秒
+  scrollDelay: 2500,          // 滚动间隔 2.5 秒
+  betweenTweetsDelay: 5000,   // 推文间延迟 5 秒
+  randomDelay: true,          // 启用随机延迟
+  randomDelayRange: [1000, 3000], // 随机增加 1-3 秒
+};
+
+// 预设配置
+export const SCRAPE_PRESETS = {
+  // 极慢模式 - 最安全
+  ultraSlow: {
+    pageLoadDelay: 5000,
+    scrollDelay: 4000,
+    betweenTweetsDelay: 10000,
+    randomDelay: true,
+    randomDelayRange: [2000, 5000] as [number, number],
+  },
+  // 慢速模式 - 安全
+  slow: {
+    pageLoadDelay: 3000,
+    scrollDelay: 2500,
+    betweenTweetsDelay: 5000,
+    randomDelay: true,
+    randomDelayRange: [1000, 3000] as [number, number],
+  },
+  // 正常模式 - 有一定风险
+  normal: {
+    pageLoadDelay: 2000,
+    scrollDelay: 1500,
+    betweenTweetsDelay: 3000,
+    randomDelay: true,
+    randomDelayRange: [500, 1500] as [number, number],
+  },
+  // 快速模式 - 高风险
+  fast: {
+    pageLoadDelay: 1000,
+    scrollDelay: 1000,
+    betweenTweetsDelay: 2000,
+    randomDelay: true,
+    randomDelayRange: [300, 800] as [number, number],
+  },
+};
+
+// 当前配置
+let currentConfig: ScrapeConfig = { ...DEFAULT_SCRAPE_CONFIG };
+
+// 设置爬取配置
+export function setScrapeConfig(config: Partial<ScrapeConfig>): void {
+  currentConfig = { ...currentConfig, ...config };
+}
+
+// 获取当前配置
+export function getScrapeConfig(): ScrapeConfig {
+  return { ...currentConfig };
+}
+
+// 应用预设
+export function applyScrapePreset(preset: keyof typeof SCRAPE_PRESETS): void {
+  currentConfig = { ...SCRAPE_PRESETS[preset] };
+}
+
+// 计算实际延迟（包含随机部分）
+function getDelay(baseDelay: number): number {
+  if (!currentConfig.randomDelay) {
+    return baseDelay;
+  }
+  const [min, max] = currentConfig.randomDelayRange;
+  const randomExtra = Math.floor(Math.random() * (max - min + 1)) + min;
+  return baseDelay + randomExtra;
+}
+
+// 等待函数
+async function wait(baseDelay: number): Promise<void> {
+  const delay = getDelay(baseDelay);
+  await new Promise(resolve => setTimeout(resolve, delay));
+}
+
 // Store browser instance for reuse
 let browserInstance: Browser | null = null;
 
 async function getBrowser(): Promise<Browser> {
   if (!browserInstance || !browserInstance.isConnected()) {
-    // Try to find the chromium executable
+    // 强制使用 chromium 而不是 chromium_headless_shell
+    // 按优先级查找可用的浏览器路径
     const possiblePaths = [
-      process.env.HOME + '/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome',
-      '/home/ubuntu/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome',
       '/root/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome',
+      '/home/ubuntu/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome',
+      process.env.HOME + '/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome',
     ];
     
     let executablePath: string | undefined;
+    const fs = await import('fs');
+    
     for (const p of possiblePaths) {
       try {
-        const fs = await import('fs');
         if (fs.existsSync(p)) {
           executablePath = p;
+          console.log('[Playwright] Using browser at:', p);
           break;
         }
       } catch (e) {
         // Continue to next path
       }
+    }
+
+    if (!executablePath) {
+      console.error('[Playwright] No browser found at any of:', possiblePaths);
+      throw new Error('Playwright 浏览器未找到，请联系管理员');
     }
 
     browserInstance = await chromium.launch({
@@ -72,9 +173,19 @@ async function getBrowser(): Promise<Browser> {
 
 async function createContext(cookies?: string): Promise<BrowserContext> {
   const browser = await getBrowser();
+  
+  // 随机选择一个 User-Agent
+  const userAgents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+  ];
+  const randomUserAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
+  
   const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
+    userAgent: randomUserAgent,
+    viewport: { width: 1280 + Math.floor(Math.random() * 200), height: 800 + Math.floor(Math.random() * 100) },
     locale: 'en-US',
   });
 
@@ -149,6 +260,9 @@ export async function scrapeUserTweets(
     const url = `https://x.com/${username}`;
     await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
 
+    // 页面加载后等待
+    await wait(currentConfig.pageLoadDelay);
+
     // Wait for tweets to load
     await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 }).catch(() => null);
 
@@ -160,7 +274,7 @@ export async function scrapeUserTweets(
 
     const tweets: Tweet[] = [];
     let scrollAttempts = 0;
-    const maxScrollAttempts = 10;
+    const maxScrollAttempts = Math.min(10, Math.ceil(maxTweets / 3)); // 限制滚动次数
 
     while (tweets.length < maxTweets && scrollAttempts < maxScrollAttempts) {
       // Extract tweets from current view
@@ -226,7 +340,7 @@ export async function scrapeUserTweets(
 
       // Scroll down to load more
       await page.evaluate(() => window.scrollBy(0, 800));
-      await page.waitForTimeout(1500);
+      await wait(currentConfig.scrollDelay);
       scrollAttempts++;
     }
 
@@ -259,6 +373,9 @@ export async function scrapeTweetReplies(
     const url = `https://x.com/i/web/status/${tweetId}`;
     await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
 
+    // 页面加载后等待
+    await wait(currentConfig.pageLoadDelay);
+
     // Wait for replies to load
     await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 }).catch(() => null);
 
@@ -270,7 +387,7 @@ export async function scrapeTweetReplies(
 
     const replies: Reply[] = [];
     let scrollAttempts = 0;
-    const maxScrollAttempts = 15;
+    const maxScrollAttempts = Math.min(15, Math.ceil(maxReplies / 5)); // 限制滚动次数
     let isFirstTweet = true;
 
     while (replies.length < maxReplies && scrollAttempts < maxScrollAttempts) {
@@ -334,7 +451,7 @@ export async function scrapeTweetReplies(
 
       // Scroll down to load more replies
       await page.evaluate(() => window.scrollBy(0, 600));
-      await page.waitForTimeout(1500);
+      await wait(currentConfig.scrollDelay);
       scrollAttempts++;
     }
 
@@ -373,8 +490,8 @@ export async function scrapeUserComments(
       if (repliesResult.success && repliesResult.replies) {
         allReplies.push(...repliesResult.replies);
       }
-      // Add delay between requests to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // 推文间延迟 - 使用配置的延迟
+      await wait(currentConfig.betweenTweetsDelay);
     }
   }
 

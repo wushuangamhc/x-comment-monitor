@@ -22,7 +22,16 @@ import {
   getAllConfigs,
   getAllCommentsForExport,
 } from "./db";
-import { scrapeUserTweets, scrapeTweetReplies, scrapeUserComments as playwrightScrapeUserComments } from "./twitterScraper";
+import { 
+  scrapeUserTweets, 
+  scrapeTweetReplies, 
+  scrapeUserComments as playwrightScrapeUserComments,
+  getScrapeConfig,
+  setScrapeConfig,
+  applyScrapePreset,
+  SCRAPE_PRESETS,
+  type ScrapeConfig,
+} from "./twitterScraper";
 
 // Sentiment types
 const sentimentEnum = z.enum(["positive", "neutral", "negative", "anger", "sarcasm"]);
@@ -416,6 +425,54 @@ ${commentTexts}
 
     list: protectedProcedure.query(async () => {
       return await getAllConfigs();
+    }),
+
+    // 爬取频率配置
+    getScrapeConfig: protectedProcedure.query(() => {
+      return getScrapeConfig();
+    }),
+
+    setScrapeConfig: protectedProcedure
+      .input(z.object({
+        pageLoadDelay: z.number().min(1000).max(10000).optional(),
+        scrollDelay: z.number().min(1000).max(10000).optional(),
+        betweenTweetsDelay: z.number().min(2000).max(30000).optional(),
+        randomDelay: z.boolean().optional(),
+        randomDelayMin: z.number().min(500).max(10000).optional(),
+        randomDelayMax: z.number().min(1000).max(15000).optional(),
+      }))
+      .mutation(({ input }) => {
+        const config: Partial<ScrapeConfig> = {};
+        if (input.pageLoadDelay !== undefined) config.pageLoadDelay = input.pageLoadDelay;
+        if (input.scrollDelay !== undefined) config.scrollDelay = input.scrollDelay;
+        if (input.betweenTweetsDelay !== undefined) config.betweenTweetsDelay = input.betweenTweetsDelay;
+        if (input.randomDelay !== undefined) config.randomDelay = input.randomDelay;
+        if (input.randomDelayMin !== undefined && input.randomDelayMax !== undefined) {
+          config.randomDelayRange = [input.randomDelayMin, input.randomDelayMax];
+        }
+        setScrapeConfig(config);
+        return { success: true, config: getScrapeConfig() };
+      }),
+
+    applyScrapePreset: protectedProcedure
+      .input(z.object({
+        preset: z.enum(['ultraSlow', 'slow', 'normal', 'fast']),
+      }))
+      .mutation(({ input }) => {
+        applyScrapePreset(input.preset);
+        return { success: true, config: getScrapeConfig() };
+      }),
+
+    getScrapePresets: publicProcedure.query(() => {
+      return {
+        presets: Object.keys(SCRAPE_PRESETS),
+        descriptions: {
+          ultraSlow: '极慢模式 - 最安全，推文间延迟 10+ 秒',
+          slow: '慢速模式 - 安全，推文间延迟 5+ 秒（默认）',
+          normal: '正常模式 - 有一定风险，推文间延迟 3+ 秒',
+          fast: '快速模式 - 高风险，推文间延迟 2+ 秒',
+        },
+      };
     }),
   }),
 
