@@ -9,7 +9,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
-import { ArrowLeft, Save, Upload, Key, Bot, RefreshCw, ExternalLink, CheckCircle, AlertCircle, Globe, Cookie } from "lucide-react";
+import { ArrowLeft, Save, Upload, Key, Bot, RefreshCw, ExternalLink, CheckCircle, AlertCircle, Globe, Cookie, Plus, Trash2, Users } from "lucide-react";
 import { Link } from "wouter";
 import { getLoginUrl } from "@/const";
 
@@ -21,7 +21,9 @@ export default function Settings() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [apifyToken, setApifyToken] = useState("");
   const [apifyTokenSaved, setApifyTokenSaved] = useState(false);
-  const [xCookies, setXCookies] = useState("");
+  
+  // 多账号 Cookie 管理
+  const [xCookiesList, setXCookiesList] = useState<string[]>([""]);
   const [xCookiesSaved, setXCookiesSaved] = useState(false);
 
   // Fetch existing configs
@@ -32,6 +34,11 @@ export default function Settings() {
 
   const { data: existingXCookies } = trpc.config.get.useQuery(
     { key: "X_COOKIES" },
+    { enabled: isAuthenticated }
+  );
+
+  const { data: existingXCookiesList } = trpc.config.get.useQuery(
+    { key: "X_COOKIES_LIST" },
     { enabled: isAuthenticated }
   );
 
@@ -47,6 +54,19 @@ export default function Settings() {
     }
   }, [existingXCookies]);
 
+  useEffect(() => {
+    if (existingXCookiesList) {
+      try {
+        const list = JSON.parse(existingXCookiesList);
+        if (Array.isArray(list) && list.length > 0) {
+          setXCookiesList(list);
+        }
+      } catch (e) {
+        // Ignore parse errors
+      }
+    }
+  }, [existingXCookiesList]);
+
   // Config mutations
   const setConfigMutation = trpc.config.set.useMutation({
     onSuccess: () => {
@@ -60,16 +80,17 @@ export default function Settings() {
     onSuccess: (data) => {
       toast.success(`成功导入 ${data.imported} 条评论`);
       setImportData("");
+      setTweetId("");
     },
     onError: (err) => toast.error(`导入失败: ${err.message}`),
   });
 
   // Analyze mutation
   const analyzeMutation = trpc.analysis.analyzeUnanalyzed.useMutation({
-    onSuccess: (data) => {
+    onSuccess: (data: { analyzed: number }) => {
       toast.success(`成功分析 ${data.analyzed} 条评论`);
     },
-    onError: (err) => toast.error(`分析失败: ${err.message}`),
+    onError: (err: any) => toast.error(`分析失败: ${err.message}`),
   });
 
   const handleImport = async () => {
@@ -105,17 +126,52 @@ export default function Settings() {
     }
   };
 
-  const handleSaveXCookies = () => {
-    if (!xCookies.trim()) {
-      toast.error("请输入 X Cookie");
+  // 添加新账号
+  const handleAddAccount = () => {
+    setXCookiesList([...xCookiesList, ""]);
+  };
+
+  // 删除账号
+  const handleRemoveAccount = (index: number) => {
+    if (xCookiesList.length <= 1) {
+      toast.error("至少需要保留一个账号");
       return;
     }
-    setConfigMutation.mutate({
+    const newList = xCookiesList.filter((_, i) => i !== index);
+    setXCookiesList(newList);
+  };
+
+  // 更新账号 Cookie
+  const handleUpdateAccountCookie = (index: number, value: string) => {
+    const newList = [...xCookiesList];
+    newList[index] = value;
+    setXCookiesList(newList);
+  };
+
+  // 保存所有账号 Cookie
+  const handleSaveAllCookies = async () => {
+    const validCookies = xCookiesList.filter(c => c.trim());
+    if (validCookies.length === 0) {
+      toast.error("请至少配置一个有效的 Cookie");
+      return;
+    }
+
+    // 保存第一个作为主 Cookie
+    await setConfigMutation.mutateAsync({
       key: "X_COOKIES",
-      value: xCookies.trim(),
-      description: "X/Twitter Cookies for Playwright scraping",
+      value: validCookies[0],
+      description: "Primary X/Twitter Cookie for Playwright scraping",
     });
+
+    // 保存完整列表
+    await setConfigMutation.mutateAsync({
+      key: "X_COOKIES_LIST",
+      value: JSON.stringify(validCookies),
+      description: "List of X/Twitter Cookies for rotation",
+    });
+
     setXCookiesSaved(true);
+    toast.success(`已保存 ${validCookies.length} 个账号的 Cookie`);
   };
 
   const handleSaveApifyToken = () => {
@@ -191,27 +247,27 @@ export default function Settings() {
                 </h3>
                 <p className="text-sm text-green-700 dark:text-green-300">
                   系统会<strong>优先使用 Playwright 自爬</strong>（免费），如果失败则自动切换到 Apify API（付费）。
-                  建议先配置 X Cookie 以启用免费自爬功能。
+                  支持配置多个 X 账号 Cookie，系统会自动轮换使用以降低单账号被封风险。
                 </p>
               </div>
 
-              {/* X Cookies Config - Primary (Free) */}
+              {/* X Cookies Config - Multiple Accounts */}
               <Card className="border-green-500/50">
                 <CardHeader>
                   <div className="flex items-center justify-between">
                     <div>
                       <CardTitle className="flex items-center gap-2">
-                        <Cookie className="w-5 h-5" />
-                        X Cookie 配置（免费自爬）
+                        <Users className="w-5 h-5" />
+                        多账号 Cookie 配置（免费自爬）
                         {xCookiesSaved && (
                           <Badge variant="secondary" className="text-green-600">
                             <CheckCircle className="w-3 h-3 mr-1" />
-                            已配置
+                            已配置 {xCookiesList.filter(c => c.trim()).length} 个账号
                           </Badge>
                         )}
                       </CardTitle>
                       <CardDescription>
-                        配置 X/Twitter Cookie 以启用 Playwright 免费自爬功能
+                        配置多个 X/Twitter 账号 Cookie，系统会自动轮换使用
                       </CardDescription>
                     </div>
                   </div>
@@ -219,47 +275,74 @@ export default function Settings() {
                 <CardContent className="space-y-4">
                   <div className="p-4 bg-green-50 dark:bg-green-900/20 rounded-lg border border-green-200 dark:border-green-800">
                     <h3 className="font-medium text-green-800 dark:text-green-200 mb-2">
-                      如何获取 X Cookie
+                      多账号轮换说明
                     </h3>
-                    <ol className="text-sm text-green-700 dark:text-green-300 space-y-2 list-decimal list-inside">
-                      <li>在浏览器中登录 X.com</li>
-                      <li>按 F12 打开开发者工具，切换到 Application 标签</li>
-                      <li>在左侧找到 Cookies → https://x.com</li>
-                      <li>复制所有 Cookie（特别是 auth_token 和 ct0）</li>
-                      <li>
-                        格式示例：
-                        <code className="bg-green-100 dark:bg-green-800 px-1 rounded text-xs">
-                          {`[{"name":"auth_token","value":"xxx"},{"name":"ct0","value":"xxx"}]`}
-                        </code>
-                      </li>
-                    </ol>
-                    <p className="text-xs mt-3 text-green-600 dark:text-green-400">
-                      ⚠️ Cookie 会过期，如果采集失败请重新获取
-                    </p>
+                    <ul className="text-sm text-green-700 dark:text-green-300 space-y-1">
+                      <li>• 配置多个账号可以分散采集压力，降低单账号被封风险</li>
+                      <li>• 系统会自动轮换使用不同账号进行采集</li>
+                      <li>• 建议使用小号，避免主账号被封</li>
+                      <li>• 每个账号的 Cookie 格式相同</li>
+                    </ul>
                     <Link href="/cookie-guide">
-                      <Button variant="link" className="p-0 h-auto text-green-700 dark:text-green-300">
-                        📖 查看详细获取教程（包含一键导出脚本）
+                      <Button variant="link" className="p-0 h-auto text-green-700 dark:text-green-300 mt-2">
+                        📖 查看 Cookie 获取教程
                       </Button>
                     </Link>
                   </div>
 
-                  <div className="space-y-2">
-                    <Label>X Cookie (JSON 格式)</Label>
-                    <div className="flex gap-2">
-                      <Textarea
-                        placeholder={`[{"name":"auth_token","value":"your_token"},{"name":"ct0","value":"your_ct0"}]`}
-                        value={xCookies}
-                        onChange={(e) => setXCookies(e.target.value)}
-                        className="flex-1 min-h-[100px] font-mono text-sm"
-                      />
-                    </div>
-                    <Button onClick={handleSaveXCookies} disabled={setConfigMutation.isPending} className="w-full">
+                  {/* 账号列表 */}
+                  <div className="space-y-4">
+                    {xCookiesList.map((cookie, index) => (
+                      <div key={index} className="space-y-2 p-4 border rounded-lg bg-card">
+                        <div className="flex items-center justify-between">
+                          <Label className="flex items-center gap-2">
+                            <Cookie className="w-4 h-4" />
+                            账号 {index + 1}
+                            {index === 0 && (
+                              <Badge variant="outline" className="text-xs">主账号</Badge>
+                            )}
+                          </Label>
+                          {xCookiesList.length > 1 && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => handleRemoveAccount(index)}
+                              className="text-red-500 hover:text-red-700"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </Button>
+                          )}
+                        </div>
+                        <Textarea
+                          placeholder={`[{"name":"auth_token","value":"xxx"},{"name":"ct0","value":"xxx"}]`}
+                          value={cookie}
+                          onChange={(e) => handleUpdateAccountCookie(index, e.target.value)}
+                          className="min-h-[80px] font-mono text-sm"
+                        />
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      onClick={handleAddAccount}
+                      className="flex-1"
+                    >
+                      <Plus className="w-4 h-4 mr-2" />
+                      添加账号
+                    </Button>
+                    <Button
+                      onClick={handleSaveAllCookies}
+                      disabled={setConfigMutation.isPending}
+                      className="flex-1"
+                    >
                       {setConfigMutation.isPending ? (
                         <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
                       ) : (
                         <Save className="w-4 h-4 mr-2" />
                       )}
-                      保存 Cookie
+                      保存所有账号
                     </Button>
                   </div>
 

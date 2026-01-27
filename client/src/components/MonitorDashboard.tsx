@@ -80,6 +80,14 @@ export function MonitorDashboard() {
   const [newCommentsCount, setNewCommentsCount] = useState(0);
   const [lastCommentCount, setLastCommentCount] = useState(0);
   const [isFetching, setIsFetching] = useState(false);
+  const [fetchProgress, setFetchProgress] = useState<{
+    stage: string;
+    message: string;
+    tweetsFound: number;
+    repliesFound: number;
+    currentTweet: number;
+    totalTweets: number;
+  } | null>(null);
   
   // Custom time range states
   const [customStartDate, setCustomStartDate] = useState<Date | undefined>(undefined);
@@ -156,10 +164,12 @@ export function MonitorDashboard() {
         toast.error(data.error || "获取失败");
       }
       setIsFetching(false);
+      setFetchProgress(null);
     },
     onError: (error) => {
       toast.error(`获取失败: ${error.message}`);
       setIsFetching(false);
+      setFetchProgress(null);
     },
   });
 
@@ -213,6 +223,14 @@ export function MonitorDashboard() {
   const startFetching = async (username: string) => {
     setIsFetching(true);
     setActiveAccount(username);
+    setFetchProgress({
+      stage: 'init',
+      message: '正在初始化...',
+      tweetsFound: 0,
+      repliesFound: 0,
+      currentTweet: 0,
+      totalTweets: 10,
+    });
     // 使用智能采集，优先 Playwright，备选 Apify
     smartFetch.mutate({ 
       username, 
@@ -613,10 +631,17 @@ export function MonitorDashboard() {
             )}
 
             {isFetching && (
-              <Badge variant="secondary" className="animate-pulse">
-                <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
-                正在获取...
-              </Badge>
+              <div className="flex items-center gap-2">
+                <Badge variant="secondary" className="animate-pulse">
+                  <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
+                  {fetchProgress?.message || '正在获取...'}
+                </Badge>
+                {fetchProgress && fetchProgress.tweetsFound > 0 && (
+                  <span className="text-xs text-muted-foreground">
+                    推文: {fetchProgress.currentTweet}/{fetchProgress.totalTweets} | 评论: {fetchProgress.repliesFound}
+                  </span>
+                )}
+              </div>
             )}
           </div>
 

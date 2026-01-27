@@ -23,14 +23,17 @@ import {
   getAllCommentsForExport,
 } from "./db";
 import { 
-  scrapeUserTweets, 
-  scrapeTweetReplies, 
   scrapeUserComments as playwrightScrapeUserComments,
   getScrapeConfig,
   setScrapeConfig,
   applyScrapePreset,
   SCRAPE_PRESETS,
+  setAccountCookies,
+  addAccountCookie,
+  removeAccountCookie,
+  getAccountCount,
   type ScrapeConfig,
+  type ScrapeProgress,
 } from "./twitterScraper";
 
 // Sentiment types
@@ -724,9 +727,8 @@ ${commentTexts}
         try {
           const result = await playwrightScrapeUserComments(
             input.username,
-            xCookies || undefined,
             input.maxTweets,
-            input.maxRepliesPerTweet
+            xCookies || undefined
           );
 
           if (!result.success) {
@@ -735,30 +737,32 @@ ${commentTexts}
 
           // Insert replies into database
           let insertedCount = 0;
-          for (const reply of result.replies) {
-            try {
-              await insertRawComment({
-                replyId: reply.id,
-                tweetId: reply.replyTo,
-                authorId: reply.authorId,
-                authorName: reply.authorName,
-                authorHandle: reply.authorHandle,
-                text: reply.text,
-                createdAt: new Date(reply.createdAt),
-                likeCount: reply.likeCount,
-                replyTo: reply.replyTo,
-              });
-              insertedCount++;
-            } catch (err) {
-              // Ignore duplicate errors
+          if (result.replies) {
+            for (const reply of result.replies) {
+              try {
+                await insertRawComment({
+                  replyId: reply.id,
+                  tweetId: reply.replyTo,
+                  authorId: reply.authorId,
+                  authorName: reply.authorName,
+                  authorHandle: reply.authorHandle,
+                  text: reply.text,
+                  createdAt: new Date(reply.createdAt),
+                  likeCount: reply.likeCount,
+                  replyTo: reply.replyTo,
+                });
+                insertedCount++;
+              } catch (err) {
+                // Ignore duplicate errors
+              }
             }
           }
 
           return {
             success: true,
             commentsCount: insertedCount,
-            tweetsCount: result.tweets.length,
-            totalScraped: result.totalReplies,
+            tweetsCount: result.tweets?.length || 0,
+            totalScraped: result.replies?.length || 0,
           };
         } catch (error) {
           return { success: false, error: String(error), commentsCount: 0, tweetsCount: 0 };
@@ -782,12 +786,11 @@ ${commentTexts}
           try {
             const result = await playwrightScrapeUserComments(
               input.username,
-              xCookies || undefined,
               input.maxTweets,
-              input.maxRepliesPerTweet
+              xCookies || undefined
             );
 
-            if (result.success && result.totalReplies > 0) {
+            if (result.success && result.replies && result.replies.length > 0) {
               // Insert replies into database
               let insertedCount = 0;
               for (const reply of result.replies) {
@@ -813,7 +816,7 @@ ${commentTexts}
                 success: true,
                 method: 'playwright',
                 commentsCount: insertedCount,
-                tweetsCount: result.tweets.length,
+                tweetsCount: result.tweets?.length || 0,
                 message: `使用 Playwright 成功采集 ${insertedCount} 条评论`,
               };
             }
