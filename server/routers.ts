@@ -863,8 +863,11 @@ ${commentTexts}
             };
           }
 
-          // Use existing Apify logic (simplified version)
+          // Use Apify to fetch tweets and their replies
           try {
+            console.log(`[Apify] 开始获取 @${input.username} 的推文...`);
+            
+            // Step 1: Get user's tweets
             const tweetsResponse = await fetch(
               `https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite/runs?token=${apifyToken}`,
               {
@@ -879,16 +882,140 @@ ${commentTexts}
             );
 
             if (!tweetsResponse.ok) {
-              return { success: false, method: 'apify', error: 'Apify API 调用失败', commentsCount: 0 };
+              const errorText = await tweetsResponse.text();
+              return { success: false, method: 'apify', error: `Apify API 调用失败: ${errorText}`, commentsCount: 0 };
             }
 
+            const tweetsRun = await tweetsResponse.json();
+            const runId = tweetsRun.data?.id;
+            const datasetId = tweetsRun.data?.defaultDatasetId;
+            
+            if (!runId) {
+              return { success: false, method: 'apify', error: '无法启动 Apify 任务', commentsCount: 0 };
+            }
+
+            console.log(`[Apify] 任务已启动, runId: ${runId}, datasetId: ${datasetId}`);
+
+            // Step 2: Wait for the run to complete
+            let runStatus = 'RUNNING';
+            let attempts = 0;
+            const maxAttempts = 60; // Max 5 minutes wait
+            
+            while (runStatus === 'RUNNING' && attempts < maxAttempts) {
+              await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
+              const statusResponse = await fetch(
+                `https://api.apify.com/v2/actor-runs/${runId}?token=${apifyToken}`
+              );
+              const statusData = await statusResponse.json();
+              runStatus = statusData.data?.status || 'FAILED';
+              attempts++;
+              console.log(`[Apify] 任务状态: ${runStatus}, 尝试次数: ${attempts}`);
+            }
+
+            if (runStatus !== 'SUCCEEDED') {
+              return { success: false, method: 'apify', error: `Apify 任务未完成: ${runStatus}`, commentsCount: 0 };
+            }
+
+            // Step 3: Get tweets from dataset
+            const tweetsDataResponse = await fetch(
+              `https://api.apify.com/v2/datasets/${datasetId}/items?token=${apifyToken}`
+            );
+            const tweets = await tweetsDataResponse.json();
+            console.log(`[Apify] 获取到 ${tweets?.length || 0} 条推文`);
+
+            if (!tweets || tweets.length === 0) {
+              return { success: false, method: 'apify', error: '未找到该用户的推文', commentsCount: 0 };
+            }
+
+            // Step 4: For each tweet, fetch replies using conversation_id
+            let totalComments = 0;
+            const tweetIds = tweets.slice(0, input.maxTweets).map((t: any) => t.id);
+            console.log(`[Apify] 开始获取 ${tweetIds.length} 条推文的评论...`);
+
+            for (let i = 0; i < tweetIds.length; i++) {
+              const tweetId = tweetIds[i];
+              try {
+                console.log(`[Apify] 获取推文 ${tweetId} 的评论 (${i + 1}/${tweetIds.length})...`);
+                
+                // Fetch replies for this tweet using conversation_id
+                const repliesResponse = await fetch(
+                  `https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite/runs?token=${apifyToken}`,
+                  {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      searchTerms: [`conversation_id:${tweetId}`],
+                      sort: 'Latest',
+                      maxItems: input.maxRepliesPerTweet,
+                    }),
+                  }
+                );
+
+                if (!repliesResponse.ok) continue;
+
+                const repliesRun = await repliesResponse.json();
+                const repliesRunId = repliesRun.data?.id;
+                const repliesDatasetId = repliesRun.data?.defaultDatasetId;
+                if (!repliesRunId) continue;
+
+                // Wait for replies run to complete
+                let repliesStatus = 'RUNNING';
+                let repliesAttempts = 0;
+                while (repliesStatus === 'RUNNING' && repliesAttempts < 30) {
+                  await new Promise(resolve => setTimeout(resolve, 3000));
+                  const statusResp = await fetch(
+                    `https://api.apify.com/v2/actor-runs/${repliesRunId}?token=${apifyToken}`
+                  );
+                  const statusData = await statusResp.json();
+                  repliesStatus = statusData.data?.status || 'FAILED';
+                  repliesAttempts++;
+                }
+
+                if (repliesStatus !== 'SUCCEEDED') continue;
+
+                // Get replies from dataset
+                const repliesDataResponse = await fetch(
+                  `https://api.apify.com/v2/datasets/${repliesDatasetId}/items?token=${apifyToken}`
+                );
+                const replies = await repliesDataResponse.json();
+                console.log(`[Apify] 推文 ${tweetId} 获取到 ${replies?.length || 0} 条评论`);
+
+                // Insert replies into database
+                for (const reply of replies) {
+                  if (reply.id === tweetId) continue; // Skip the original tweet
+                  try {
+                    await insertRawComment({
+                      replyId: reply.id || String(Date.now()) + Math.random(),
+                      tweetId: tweetId,
+                      authorId: reply.author?.id || reply.userId || reply.user?.id || 'unknown',
+                      authorName: reply.author?.name || reply.userName || reply.user?.name || 'Unknown',
+                      authorHandle: reply.author?.userName || reply.userScreenName || reply.user?.screen_name || 'unknown',
+                      text: reply.text || reply.fullText || reply.full_text || '',
+                      createdAt: new Date(reply.createdAt || reply.created_at || Date.now()),
+                      likeCount: reply.likeCount || reply.favoriteCount || reply.favorite_count || 0,
+                      replyTo: reply.inReplyToStatusId || reply.in_reply_to_status_id || tweetId,
+                    });
+                    totalComments++;
+                  } catch (err) {
+                    // Ignore duplicate errors
+                    console.log(`[Apify] 插入评论失败:`, err);
+                  }
+                }
+              } catch (err) {
+                console.error(`[Apify] 获取推文 ${tweetId} 的评论失败:`, err);
+              }
+            }
+
+            console.log(`[Apify] 完成！共获取 ${totalComments} 条评论`);
             return {
               success: true,
               method: 'apify',
-              message: 'Apify 任务已启动，请稍后刷新查看结果',
-              commentsCount: 0,
+              message: `使用 Apify 成功获取 ${totalComments} 条评论`,
+              commentsCount: totalComments,
+              tweetsCount: tweetIds.length,
             };
           } catch (err) {
+            console.error('[Apify] 错误:', err);
             return { success: false, method: 'apify', error: String(err), commentsCount: 0 };
           }
         }
