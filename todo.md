@@ -59,3 +59,5 @@
 ## Bug 修复
 - [x] 修复 Playwright 浏览器未安装问题
 - [x] 优化 Cookie 获取说明和流程（添加一键导出脚本）
+
+- [x] 修复 Playwright 在 root 用户下的浏览器路径问题
