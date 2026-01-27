@@ -80,3 +80,9 @@
 - [x] 支持配置多个 X Cookie 账号
 - [x] 实现账号轮换采集功能
 - [x] 添加采集进度实时显示
+
+## 采集方式优化
+- [x] 修复 Playwright 浏览器路径（添加 chromium_headless_shell 支持）
+- [x] Playwright 作为默认免费采集方式
+- [x] Apify 作为备选付费方式
+- [x] 在 Playwright 不可用时自动切换到 Apify

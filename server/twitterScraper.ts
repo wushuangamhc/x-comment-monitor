@@ -165,6 +165,10 @@ async function getBrowser(): Promise<Browser> {
   if (!browserInstance || !browserInstance.isConnected()) {
     // 尝试多种方式启动浏览器
     const possiblePaths = [
+      // chromium_headless_shell (Playwright 默认使用)
+      '/root/.cache/ms-playwright/chromium_headless_shell-1208/chrome-headless-shell-linux64/chrome-headless-shell',
+      '/home/ubuntu/.cache/ms-playwright/chromium_headless_shell-1208/chrome-headless-shell-linux64/chrome-headless-shell',
+      // chromium (备选)
       '/root/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome',
       '/home/ubuntu/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome',
       process.env.HOME + '/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome',
