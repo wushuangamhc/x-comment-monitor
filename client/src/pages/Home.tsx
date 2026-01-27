@@ -1,30 +1,62 @@
 import { useAuth } from "@/_core/hooks/useAuth";
 import { Button } from "@/components/ui/button";
-import { Loader2 } from "lucide-react";
 import { getLoginUrl } from "@/const";
-import { Streamdown } from 'streamdown';
+import { MonitorDashboard } from "@/components/MonitorDashboard";
+import { Settings, LogIn, LogOut } from "lucide-react";
+import { Link } from "wouter";
 
-/**
- * All content in this page are only for example, replace with your own feature implementation
- * When building pages, remember your instructions in Frontend Workflow, Frontend Best Practices, Design Guide and Common Pitfalls
- */
 export default function Home() {
-  // The userAuth hooks provides authentication state
-  // To implement login/logout functionality, simply call logout() or redirect to getLoginUrl()
-  let { user, loading, error, isAuthenticated, logout } = useAuth();
+  const { user, loading, isAuthenticated, logout } = useAuth();
 
-  // If theme is switchable in App.tsx, we can implement theme toggling like this:
-  // const { theme, toggleTheme } = useTheme();
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <div className="animate-pulse text-muted-foreground">加载中...</div>
+      </div>
+    );
+  }
 
   return (
-    <div className="min-h-screen flex flex-col">
-      <main>
-        {/* Example: lucide-react for icons */}
-        <Loader2 className="animate-spin" />
-        Example Page
-        {/* Example: Streamdown for markdown rendering */}
-        <Streamdown>Any **markdown** content</Streamdown>
-        <Button variant="default">Example Button</Button>
+    <div className="min-h-screen flex flex-col bg-background">
+      {/* Header */}
+      <header className="border-b bg-card/50 backdrop-blur-sm sticky top-0 z-50">
+        <div className="container flex items-center justify-between h-14">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
+              <span className="text-primary-foreground font-bold text-sm">X</span>
+            </div>
+            <h1 className="font-semibold text-lg">评论监控与分析</h1>
+          </div>
+          
+          <div className="flex items-center gap-2">
+            {isAuthenticated ? (
+              <>
+                <Link href="/settings">
+                  <Button variant="ghost" size="sm">
+                    <Settings className="w-4 h-4 mr-2" />
+                    设置
+                  </Button>
+                </Link>
+                <span className="text-sm text-muted-foreground">{user?.name}</span>
+                <Button variant="ghost" size="sm" onClick={() => logout()}>
+                  <LogOut className="w-4 h-4" />
+                </Button>
+              </>
+            ) : (
+              <Button asChild size="sm">
+                <a href={getLoginUrl()}>
+                  <LogIn className="w-4 h-4 mr-2" />
+                  登录
+                </a>
+              </Button>
+            )}
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="flex-1">
+        <MonitorDashboard />
       </main>
     </div>
   );
