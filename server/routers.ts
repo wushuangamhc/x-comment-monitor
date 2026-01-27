@@ -21,6 +21,7 @@ import {
   setConfig,
   getAllConfigs,
   getAllCommentsForExport,
+  deleteConfig,
 } from "./db";
 import { 
   scrapeUserComments as playwrightScrapeUserComments,
@@ -429,6 +430,14 @@ ${commentTexts}
     list: protectedProcedure.query(async () => {
       return await getAllConfigs();
     }),
+
+    // 删除配置
+    delete: protectedProcedure
+      .input(z.object({ key: z.string() }))
+      .mutation(async ({ input }) => {
+        await deleteConfig(input.key);
+        return { success: true };
+      }),
 
     // 爬取频率配置
     getScrapeConfig: protectedProcedure.query(() => {

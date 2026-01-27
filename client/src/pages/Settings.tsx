@@ -75,6 +75,14 @@ export default function Settings() {
     onError: (err) => toast.error(`保存失败: ${err.message}`),
   });
 
+  // Delete config mutation
+  const deleteConfigMutation = trpc.config.delete.useMutation({
+    onSuccess: () => {
+      toast.success("配置已清空");
+    },
+    onError: (err) => toast.error(`清空失败: ${err.message}`),
+  });
+
   // Import comments mutation
   const importMutation = trpc.twitter.importComments.useMutation({
     onSuccess: (data) => {
@@ -185,6 +193,12 @@ export default function Settings() {
       description: "Apify API Token for Twitter data collection",
     });
     setApifyTokenSaved(true);
+  };
+
+  const handleClearApifyToken = async () => {
+    await deleteConfigMutation.mutateAsync({ key: "APIFY_API_TOKEN" });
+    setApifyToken("");
+    setApifyTokenSaved(false);
   };
 
   if (!isAuthenticated) {
@@ -422,7 +436,25 @@ export default function Settings() {
                           <Save className="w-4 h-4" />
                         )}
                       </Button>
+                      {apifyTokenSaved && (
+                        <Button 
+                          variant="destructive" 
+                          onClick={handleClearApifyToken} 
+                          disabled={deleteConfigMutation.isPending}
+                        >
+                          {deleteConfigMutation.isPending ? (
+                            <RefreshCw className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <Trash2 className="w-4 h-4" />
+                          )}
+                        </Button>
+                      )}
                     </div>
+                    {apifyTokenSaved && (
+                      <p className="text-xs text-muted-foreground">
+                        点击红色垃圾桶按钮可以清空 Apify 配置
+                      </p>
+                    )}
                   </div>
                 </CardContent>
               </Card>

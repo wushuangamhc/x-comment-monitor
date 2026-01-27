@@ -86,3 +86,8 @@
 - [x] Playwright 作为默认免费采集方式
 - [x] Apify 作为备选付费方式
 - [x] 在 Playwright 不可用时自动切换到 Apify
+
+## Bug 修复 - 配置问题
+- [x] 修复 Apify 配置无法清空的问题
+- [x] 添加配置删除功能
+- [x] 保存用户 Cookie 到数据库

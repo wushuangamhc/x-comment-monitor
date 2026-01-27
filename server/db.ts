@@ -346,6 +346,13 @@ export async function getAllConfigs(): Promise<SystemConfig[]> {
   return await db.select().from(systemConfig);
 }
 
+export async function deleteConfig(key: string): Promise<void> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  await db.delete(systemConfig).where(eq(systemConfig.configKey, key));
+}
+
 // ============ Export Functions ============
 export async function getAllCommentsForExport(filter?: CommentFilter) {
   const db = await getDb();
