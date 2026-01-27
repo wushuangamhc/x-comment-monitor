@@ -40,3 +40,18 @@
 ## 响应式设计
 - [x] 移动端适配
 - [x] 平板端适配
+
+## 新需求 - 用户账号监控 (Apify 集成)
+- [x] 集成 Apify Twitter Scraper Unlimited API
+- [x] 支持输入用户名自动获取推文
+- [x] 自动获取每条推文的评论 (conversation_id)
+- [x] 后台配置 Apify API Token
+- [x] 多账号舆情对比功能（已支持添加多个账号监控）
+- [ ] 定时自动采集任务
+
+## Playwright 自爬功能
+- [x] 安装 Playwright 依赖
+- [x] 实现 X/Twitter 自爬服务
+- [x] 支持 Cookie 登录配置
+- [x] 优先使用自爬，Apify 作为备选
+- [x] 前端选择爬取方式

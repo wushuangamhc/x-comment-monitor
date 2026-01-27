@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { trpc } from "@/lib/trpc";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -9,10 +9,13 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { toast } from "sonner";
 import { 
   RefreshCw, Clock, Filter, TrendingUp, BarChart3, 
   MessageSquare, Heart, User, ChevronDown, ChevronUp,
-  AlertCircle, Sparkles, Search
+  AlertCircle, Sparkles, Search, Plus, Trash2, Play,
+  Settings, Users, AtSign
 } from "lucide-react";
 import { CommentCard } from "./CommentCard";
 import { AnalyticsPanel } from "./AnalyticsPanel";
@@ -20,6 +23,7 @@ import { AnalyticsPanel } from "./AnalyticsPanel";
 type SortOption = 'time_desc' | 'time_asc' | 'value_desc' | 'likes_desc';
 type TimeRange = '10m' | '1h' | '24h' | '7d' | 'custom';
 type Sentiment = 'positive' | 'neutral' | 'negative' | 'anger' | 'sarcasm';
+type MonitorMode = 'username' | 'tweet';
 
 const SENTIMENTS: { value: Sentiment; label: string; color: string }[] = [
   { value: 'positive', label: '支持', color: 'bg-green-500' },
@@ -44,9 +48,22 @@ const SORT_OPTIONS: { value: SortOption; label: string }[] = [
   { value: 'likes_desc', label: '点赞最多' },
 ];
 
+interface MonitoredAccount {
+  username: string;
+  displayName?: string;
+  isActive: boolean;
+  lastFetched?: Date;
+}
+
 export function MonitorDashboard() {
-  // Filter states
+  // Monitor mode and targets
+  const [monitorMode, setMonitorMode] = useState<MonitorMode>('username');
+  const [usernameInput, setUsernameInput] = useState("");
+  const [monitoredAccounts, setMonitoredAccounts] = useState<MonitoredAccount[]>([]);
+  const [activeAccount, setActiveAccount] = useState<string | null>(null);
   const [tweetId, setTweetId] = useState<string>("");
+  
+  // Filter states
   const [searchHandle, setSearchHandle] = useState("");
   const [selectedSentiments, setSelectedSentiments] = useState<Sentiment[]>([]);
   const [valueRange, setValueRange] = useState<[number, number]>([0, 1]);
@@ -57,6 +74,7 @@ export function MonitorDashboard() {
   const [refreshInterval, setRefreshInterval] = useState(30000);
   const [newCommentsCount, setNewCommentsCount] = useState(0);
   const [lastCommentCount, setLastCommentCount] = useState(0);
+  const [isFetching, setIsFetching] = useState(false);
 
   // Calculate time filter
   const timeFilter = useMemo(() => {
@@ -96,6 +114,24 @@ export function MonitorDashboard() {
     limit: 10,
   });
 
+  // Smart fetch mutation - 优先使用 Playwright，Apify 作为备选
+  const smartFetch = trpc.twitter.smartFetch.useMutation({
+    onSuccess: (data) => {
+      if (data.success) {
+        const method = data.method === 'playwright' ? 'Playwright 自爬' : 'Apify API';
+        toast.success(data.message || `使用 ${method} 成功获取 ${data.commentsCount} 条评论`);
+        refetch();
+      } else {
+        toast.error(data.error || "获取失败");
+      }
+      setIsFetching(false);
+    },
+    onError: (error) => {
+      toast.error(`获取失败: ${error.message}`);
+      setIsFetching(false);
+    },
+  });
+
   const toggleSentiment = (sentiment: Sentiment) => {
     setSelectedSentiments(prev => 
       prev.includes(sentiment) 
@@ -107,33 +143,157 @@ export function MonitorDashboard() {
   const lastUpdated = dataUpdatedAt ? new Date(dataUpdatedAt).toLocaleTimeString() : '--:--:--';
 
   // Track new comments
-  useMemo(() => {
+  useEffect(() => {
     if (comments && comments.length > lastCommentCount && lastCommentCount > 0) {
       setNewCommentsCount(comments.length - lastCommentCount);
     }
     if (comments) {
       setLastCommentCount(comments.length);
     }
-  }, [comments?.length]);
+  }, [comments?.length, lastCommentCount]);
+
+  // Add account to monitor
+  const addAccount = () => {
+    const username = usernameInput.trim().replace('@', '');
+    if (!username) {
+      toast.error("请输入用户名");
+      return;
+    }
+    if (monitoredAccounts.some(a => a.username.toLowerCase() === username.toLowerCase())) {
+      toast.error("该账号已在监控列表中");
+      return;
+    }
+    setMonitoredAccounts(prev => [...prev, { username, isActive: true }]);
+    setActiveAccount(username);
+    setUsernameInput("");
+    toast.success(`已添加 @${username} 到监控列表`);
+  };
+
+  // Remove account from monitor
+  const removeAccount = (username: string) => {
+    setMonitoredAccounts(prev => prev.filter(a => a.username !== username));
+    if (activeAccount === username) {
+      setActiveAccount(monitoredAccounts.find(a => a.username !== username)?.username || null);
+    }
+    toast.success(`已移除 @${username}`);
+  };
+
+  // Start fetching comments for account
+  const startFetching = async (username: string) => {
+    setIsFetching(true);
+    setActiveAccount(username);
+    // 使用智能采集，优先 Playwright，备选 Apify
+    smartFetch.mutate({ 
+      username, 
+      maxTweets: 10, 
+      maxRepliesPerTweet: 30,
+      preferredMethod: 'auto' 
+    });
+  };
 
   return (
     <div className="flex flex-col lg:flex-row min-h-[calc(100vh-3.5rem)]">
       {/* Left Sidebar - Filters */}
-      <aside className={`lg:w-72 border-r bg-card/30 transition-all ${showFilters ? '' : 'lg:w-0 lg:overflow-hidden'}`}>
-        <div className="p-4 space-y-6">
-          {/* Monitor Target */}
-          <div className="space-y-2">
-            <label className="text-sm font-medium flex items-center gap-2">
-              <Search className="w-4 h-4" />
-              监控目标
-            </label>
-            <Input
-              placeholder="输入 Tweet ID..."
-              value={tweetId}
-              onChange={(e) => setTweetId(e.target.value)}
-              className="h-9"
-            />
-          </div>
+      <aside className={`lg:w-80 border-r bg-card/30 transition-all ${showFilters ? '' : 'lg:w-0 lg:overflow-hidden'}`}>
+        <div className="p-4 space-y-4">
+          {/* Monitor Mode Tabs */}
+          <Tabs value={monitorMode} onValueChange={(v) => setMonitorMode(v as MonitorMode)}>
+            <TabsList className="w-full">
+              <TabsTrigger value="username" className="flex-1">
+                <AtSign className="w-4 h-4 mr-1" />
+                用户名
+              </TabsTrigger>
+              <TabsTrigger value="tweet" className="flex-1">
+                <MessageSquare className="w-4 h-4 mr-1" />
+                Tweet ID
+              </TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="username" className="space-y-3 mt-3">
+              <div className="flex gap-2">
+                <Input
+                  placeholder="输入 X 用户名（如 BitgetWalletCN）"
+                  value={usernameInput}
+                  onChange={(e) => setUsernameInput(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && addAccount()}
+                  className="h-9"
+                />
+                <Button size="sm" onClick={addAccount} className="h-9 px-3">
+                  <Plus className="w-4 h-4" />
+                </Button>
+              </div>
+
+              {/* Monitored Accounts List */}
+              {monitoredAccounts.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-xs text-muted-foreground font-medium">监控账号列表</p>
+                  <div className="space-y-1">
+                    {monitoredAccounts.map((account) => (
+                      <div 
+                        key={account.username}
+                        className={`flex items-center justify-between p-2 rounded-md cursor-pointer transition-colors ${
+                          activeAccount === account.username 
+                            ? 'bg-primary/10 border border-primary/30' 
+                            : 'bg-muted/50 hover:bg-muted'
+                        }`}
+                        onClick={() => setActiveAccount(account.username)}
+                      >
+                        <div className="flex items-center gap-2">
+                          <User className="w-4 h-4 text-muted-foreground" />
+                          <span className="text-sm font-medium">@{account.username}</span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 w-7 p-0"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              startFetching(account.username);
+                            }}
+                            disabled={isFetching}
+                          >
+                            <Play className={`w-3 h-3 ${isFetching && activeAccount === account.username ? 'animate-pulse' : ''}`} />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 w-7 p-0 text-destructive hover:text-destructive"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              removeAccount(account.username);
+                            }}
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </Button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {monitoredAccounts.length === 0 && (
+                <div className="text-center py-6 text-muted-foreground">
+                  <Users className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                  <p className="text-sm">添加 X 用户名开始监控</p>
+                  <p className="text-xs mt-1">例如: BitgetWalletCN</p>
+                </div>
+              )}
+            </TabsContent>
+
+            <TabsContent value="tweet" className="space-y-3 mt-3">
+              <Input
+                placeholder="输入 Tweet ID..."
+                value={tweetId}
+                onChange={(e) => setTweetId(e.target.value)}
+                className="h-9"
+              />
+              <p className="text-xs text-muted-foreground">
+                Tweet ID 是推文链接中的数字，例如: x.com/user/status/<strong>1234567890</strong>
+              </p>
+            </TabsContent>
+          </Tabs>
 
           <Separator />
 
@@ -283,9 +443,23 @@ export function MonitorDashboard() {
               )}
             </div>
 
+            {activeAccount && (
+              <Badge variant="outline" className="font-normal">
+                <AtSign className="w-3 h-3 mr-1" />
+                {activeAccount}
+              </Badge>
+            )}
+
             {newCommentsCount > 0 && (
               <Badge variant="default" className="animate-pulse">
                 +{newCommentsCount} 新评论
+              </Badge>
+            )}
+
+            {isFetching && (
+              <Badge variant="secondary" className="animate-pulse">
+                <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
+                正在获取...
               </Badge>
             )}
           </div>
@@ -339,7 +513,14 @@ export function MonitorDashboard() {
               <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
                 <AlertCircle className="w-12 h-12 mb-4 opacity-50" />
                 <p className="text-lg font-medium">暂无评论数据</p>
-                <p className="text-sm">请输入 Tweet ID 或导入评论数据</p>
+                <p className="text-sm mt-2">
+                  {monitorMode === 'username' 
+                    ? '请添加 X 用户名并点击播放按钮开始获取评论' 
+                    : '请输入 Tweet ID 查看评论'}
+                </p>
+                <p className="text-xs mt-4 text-muted-foreground/70">
+                  提示：在设置页面配置 X Cookie（免费）或 Apify Token（付费）即可自动采集
+                </p>
               </div>
             )}
           </div>

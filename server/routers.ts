@@ -21,6 +21,7 @@ import {
   setConfig,
   getAllConfigs,
 } from "./db";
+import { scrapeUserTweets, scrapeTweetReplies, scrapeUserComments as playwrightScrapeUserComments } from "./twitterScraper";
 
 // Sentiment types
 const sentimentEnum = z.enum(["positive", "neutral", "negative", "anger", "sarcasm"]);
@@ -488,6 +489,330 @@ ${commentTexts}
         } catch (error) {
           return { success: false, error: String(error), tweets: [] };
         }
+      }),
+
+    // Fetch user comments using Apify API
+    fetchUserComments: protectedProcedure
+      .input(z.object({
+        username: z.string(),
+        maxTweets: z.number().min(1).max(100).default(20),
+        maxCommentsPerTweet: z.number().min(1).max(200).default(50),
+      }))
+      .mutation(async ({ input }) => {
+        // Get Apify API token from config
+        const apifyToken = await getConfig('APIFY_API_TOKEN');
+        if (!apifyToken) {
+          return { success: false, error: '请先在设置页面配置 Apify API Token', commentsCount: 0 };
+        }
+
+        try {
+          // Step 1: Get user's tweets using Apify
+          const tweetsResponse = await fetch(
+            `https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite/runs?token=${apifyToken}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                searchTerms: [`from:${input.username}`],
+                sort: 'Latest',
+                maxItems: input.maxTweets,
+              }),
+            }
+          );
+
+          if (!tweetsResponse.ok) {
+            const errorText = await tweetsResponse.text();
+            return { success: false, error: `Apify API 调用失败: ${errorText}`, commentsCount: 0 };
+          }
+
+          const tweetsRun = await tweetsResponse.json();
+          const runId = tweetsRun.data?.id;
+          
+          if (!runId) {
+            return { success: false, error: '无法启动 Apify 任务', commentsCount: 0 };
+          }
+
+          // Wait for the run to complete (poll status)
+          let runStatus = 'RUNNING';
+          let attempts = 0;
+          const maxAttempts = 60; // Max 5 minutes wait
+          
+          while (runStatus === 'RUNNING' && attempts < maxAttempts) {
+            await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
+            const statusResponse = await fetch(
+              `https://api.apify.com/v2/actor-runs/${runId}?token=${apifyToken}`
+            );
+            const statusData = await statusResponse.json();
+            runStatus = statusData.data?.status || 'FAILED';
+            attempts++;
+          }
+
+          if (runStatus !== 'SUCCEEDED') {
+            return { success: false, error: `Apify 任务未完成: ${runStatus}`, commentsCount: 0 };
+          }
+
+          // Get tweets from dataset
+          const datasetId = tweetsRun.data?.defaultDatasetId;
+          const tweetsDataResponse = await fetch(
+            `https://api.apify.com/v2/datasets/${datasetId}/items?token=${apifyToken}`
+          );
+          const tweets = await tweetsDataResponse.json();
+
+          if (!tweets || tweets.length === 0) {
+            return { success: false, error: '未找到该用户的推文', commentsCount: 0 };
+          }
+
+          // Step 2: For each tweet, fetch replies using conversation_id
+          let totalComments = 0;
+          const tweetIds = tweets.slice(0, input.maxTweets).map((t: any) => t.id);
+
+          for (const tweetId of tweetIds) {
+            try {
+              // Fetch replies for this tweet
+              const repliesResponse = await fetch(
+                `https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite/runs?token=${apifyToken}`,
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    searchTerms: [`conversation_id:${tweetId}`],
+                    sort: 'Latest',
+                    maxItems: input.maxCommentsPerTweet,
+                  }),
+                }
+              );
+
+              if (!repliesResponse.ok) continue;
+
+              const repliesRun = await repliesResponse.json();
+              const repliesRunId = repliesRun.data?.id;
+              if (!repliesRunId) continue;
+
+              // Wait for replies run to complete
+              let repliesStatus = 'RUNNING';
+              let repliesAttempts = 0;
+              while (repliesStatus === 'RUNNING' && repliesAttempts < 30) {
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                const statusResp = await fetch(
+                  `https://api.apify.com/v2/actor-runs/${repliesRunId}?token=${apifyToken}`
+                );
+                const statusData = await statusResp.json();
+                repliesStatus = statusData.data?.status || 'FAILED';
+                repliesAttempts++;
+              }
+
+              if (repliesStatus !== 'SUCCEEDED') continue;
+
+              // Get replies from dataset
+              const repliesDatasetId = repliesRun.data?.defaultDatasetId;
+              const repliesDataResponse = await fetch(
+                `https://api.apify.com/v2/datasets/${repliesDatasetId}/items?token=${apifyToken}`
+              );
+              const replies = await repliesDataResponse.json();
+
+              // Insert replies into database
+              for (const reply of replies) {
+                if (reply.id === tweetId) continue; // Skip the original tweet
+                try {
+                  await insertRawComment({
+                    replyId: reply.id,
+                    tweetId: tweetId,
+                    authorId: reply.author?.id || reply.userId || 'unknown',
+                    authorName: reply.author?.name || reply.userName || 'Unknown',
+                    authorHandle: reply.author?.userName || reply.userScreenName || 'unknown',
+                    text: reply.text || reply.fullText || '',
+                    createdAt: new Date(reply.createdAt || Date.now()),
+                    likeCount: reply.likeCount || reply.favoriteCount || 0,
+                    replyTo: reply.inReplyToStatusId || tweetId,
+                  });
+                  totalComments++;
+                } catch (err) {
+                  // Ignore duplicate errors
+                }
+              }
+            } catch (err) {
+              console.error(`Failed to fetch replies for tweet ${tweetId}:`, err);
+            }
+          }
+
+          return { success: true, commentsCount: totalComments, tweetsProcessed: tweetIds.length };
+        } catch (error) {
+          return { success: false, error: String(error), commentsCount: 0 };
+        }
+      }),
+
+    // Playwright 自爬功能 - 免费
+    scrapeWithPlaywright: protectedProcedure
+      .input(z.object({
+        username: z.string(),
+        maxTweets: z.number().min(1).max(50).default(10),
+        maxRepliesPerTweet: z.number().min(1).max(100).default(30),
+      }))
+      .mutation(async ({ input }) => {
+        // Get X cookies from config
+        const xCookies = await getConfig('X_COOKIES');
+        
+        try {
+          const result = await playwrightScrapeUserComments(
+            input.username,
+            xCookies || undefined,
+            input.maxTweets,
+            input.maxRepliesPerTweet
+          );
+
+          if (!result.success) {
+            return { success: false, error: result.error, commentsCount: 0, tweetsCount: 0 };
+          }
+
+          // Insert replies into database
+          let insertedCount = 0;
+          for (const reply of result.replies) {
+            try {
+              await insertRawComment({
+                replyId: reply.id,
+                tweetId: reply.replyTo,
+                authorId: reply.authorId,
+                authorName: reply.authorName,
+                authorHandle: reply.authorHandle,
+                text: reply.text,
+                createdAt: new Date(reply.createdAt),
+                likeCount: reply.likeCount,
+                replyTo: reply.replyTo,
+              });
+              insertedCount++;
+            } catch (err) {
+              // Ignore duplicate errors
+            }
+          }
+
+          return {
+            success: true,
+            commentsCount: insertedCount,
+            tweetsCount: result.tweets.length,
+            totalScraped: result.totalReplies,
+          };
+        } catch (error) {
+          return { success: false, error: String(error), commentsCount: 0, tweetsCount: 0 };
+        }
+      }),
+
+    // 智能采集 - 优先使用 Playwright，Apify 作为备选
+    smartFetch: protectedProcedure
+      .input(z.object({
+        username: z.string(),
+        maxTweets: z.number().min(1).max(50).default(10),
+        maxRepliesPerTweet: z.number().min(1).max(100).default(30),
+        preferredMethod: z.enum(['playwright', 'apify', 'auto']).default('auto'),
+      }))
+      .mutation(async ({ input }) => {
+        const xCookies = await getConfig('X_COOKIES');
+        const apifyToken = await getConfig('APIFY_API_TOKEN');
+
+        // Auto mode: try Playwright first, then Apify
+        if (input.preferredMethod === 'auto' || input.preferredMethod === 'playwright') {
+          try {
+            const result = await playwrightScrapeUserComments(
+              input.username,
+              xCookies || undefined,
+              input.maxTweets,
+              input.maxRepliesPerTweet
+            );
+
+            if (result.success && result.totalReplies > 0) {
+              // Insert replies into database
+              let insertedCount = 0;
+              for (const reply of result.replies) {
+                try {
+                  await insertRawComment({
+                    replyId: reply.id,
+                    tweetId: reply.replyTo,
+                    authorId: reply.authorId,
+                    authorName: reply.authorName,
+                    authorHandle: reply.authorHandle,
+                    text: reply.text,
+                    createdAt: new Date(reply.createdAt),
+                    likeCount: reply.likeCount,
+                    replyTo: reply.replyTo,
+                  });
+                  insertedCount++;
+                } catch (err) {
+                  // Ignore duplicate errors
+                }
+              }
+
+              return {
+                success: true,
+                method: 'playwright',
+                commentsCount: insertedCount,
+                tweetsCount: result.tweets.length,
+                message: `使用 Playwright 成功采集 ${insertedCount} 条评论`,
+              };
+            }
+
+            // If Playwright failed and we're in auto mode, try Apify
+            if (input.preferredMethod === 'auto' && apifyToken) {
+              console.log('Playwright 采集失败，尝试使用 Apify...');
+            } else if (!result.success) {
+              return {
+                success: false,
+                method: 'playwright',
+                error: result.error || 'Playwright 采集失败',
+                commentsCount: 0,
+              };
+            }
+          } catch (err) {
+            if (input.preferredMethod === 'playwright') {
+              return {
+                success: false,
+                method: 'playwright',
+                error: String(err),
+                commentsCount: 0,
+              };
+            }
+          }
+        }
+
+        // Try Apify if preferred or as fallback
+        if (input.preferredMethod === 'apify' || input.preferredMethod === 'auto') {
+          if (!apifyToken) {
+            return {
+              success: false,
+              error: '请配置 X Cookie 或 Apify API Token',
+              commentsCount: 0,
+            };
+          }
+
+          // Use existing Apify logic (simplified version)
+          try {
+            const tweetsResponse = await fetch(
+              `https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite/runs?token=${apifyToken}`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  searchTerms: [`from:${input.username}`],
+                  sort: 'Latest',
+                  maxItems: input.maxTweets,
+                }),
+              }
+            );
+
+            if (!tweetsResponse.ok) {
+              return { success: false, method: 'apify', error: 'Apify API 调用失败', commentsCount: 0 };
+            }
+
+            return {
+              success: true,
+              method: 'apify',
+              message: 'Apify 任务已启动，请稍后刷新查看结果',
+              commentsCount: 0,
+            };
+          } catch (err) {
+            return { success: false, method: 'apify', error: String(err), commentsCount: 0 };
+          }
+        }
+
+        return { success: false, error: '无可用的采集方式', commentsCount: 0 };
       }),
 
     importComments: protectedProcedure
