@@ -34,14 +34,36 @@ let browserInstance: Browser | null = null;
 
 async function getBrowser(): Promise<Browser> {
   if (!browserInstance || !browserInstance.isConnected()) {
+    // Try to find the chromium executable
+    const possiblePaths = [
+      process.env.HOME + '/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome',
+      '/home/ubuntu/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome',
+      '/root/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome',
+    ];
+    
+    let executablePath: string | undefined;
+    for (const p of possiblePaths) {
+      try {
+        const fs = await import('fs');
+        if (fs.existsSync(p)) {
+          executablePath = p;
+          break;
+        }
+      } catch (e) {
+        // Continue to next path
+      }
+    }
+
     browserInstance = await chromium.launch({
       headless: true,
+      executablePath,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
+        '--single-process',
       ],
     });
   }

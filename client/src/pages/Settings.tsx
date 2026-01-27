@@ -236,6 +236,11 @@ export default function Settings() {
                     <p className="text-xs mt-3 text-green-600 dark:text-green-400">
                       ⚠️ Cookie 会过期，如果采集失败请重新获取
                     </p>
+                    <Link href="/cookie-guide">
+                      <Button variant="link" className="p-0 h-auto text-green-700 dark:text-green-300">
+                        📖 查看详细获取教程（包含一键导出脚本）
+                      </Button>
+                    </Link>
                   </div>
 
                   <div className="space-y-2">
