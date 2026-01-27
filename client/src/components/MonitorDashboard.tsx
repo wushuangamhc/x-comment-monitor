@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { trpc } from "@/lib/trpc";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -10,12 +10,17 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Calendar } from "@/components/ui/calendar";
+import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
+import { format } from "date-fns";
+import { zhCN } from "date-fns/locale";
 import { 
   RefreshCw, Clock, Filter, TrendingUp, BarChart3, 
   MessageSquare, Heart, User, ChevronDown, ChevronUp,
   AlertCircle, Sparkles, Search, Plus, Trash2, Play,
-  Settings, Users, AtSign
+  Settings, Users, AtSign, CalendarIcon, Download
 } from "lucide-react";
 import { CommentCard } from "./CommentCard";
 import { AnalyticsPanel } from "./AnalyticsPanel";
@@ -75,6 +80,12 @@ export function MonitorDashboard() {
   const [newCommentsCount, setNewCommentsCount] = useState(0);
   const [lastCommentCount, setLastCommentCount] = useState(0);
   const [isFetching, setIsFetching] = useState(false);
+  
+  // Custom time range states
+  const [customStartDate, setCustomStartDate] = useState<Date | undefined>(undefined);
+  const [customEndDate, setCustomEndDate] = useState<Date | undefined>(undefined);
+  const [customStartTime, setCustomStartTime] = useState("00:00");
+  const [customEndTime, setCustomEndTime] = useState("23:59");
 
   // Calculate time filter
   const timeFilter = useMemo(() => {
@@ -84,9 +95,29 @@ export function MonitorDashboard() {
       case '1h': return new Date(now.getTime() - 60 * 60 * 1000);
       case '24h': return new Date(now.getTime() - 24 * 60 * 60 * 1000);
       case '7d': return new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      case 'custom': {
+        if (customStartDate) {
+          const [hours, minutes] = customStartTime.split(':').map(Number);
+          const startDate = new Date(customStartDate);
+          startDate.setHours(hours, minutes, 0, 0);
+          return startDate;
+        }
+        return undefined;
+      }
       default: return undefined;
     }
-  }, [timeRange]);
+  }, [timeRange, customStartDate, customStartTime]);
+
+  // Calculate end time filter for custom range
+  const timeFilterEnd = useMemo(() => {
+    if (timeRange === 'custom' && customEndDate) {
+      const [hours, minutes] = customEndTime.split(':').map(Number);
+      const endDate = new Date(customEndDate);
+      endDate.setHours(hours, minutes, 59, 999);
+      return endDate;
+    }
+    return undefined;
+  }, [timeRange, customEndDate, customEndTime]);
 
   // Fetch comments
   const { data: comments, isLoading, refetch, dataUpdatedAt } = trpc.comments.list.useQuery({
@@ -191,6 +222,68 @@ export function MonitorDashboard() {
     });
   };
 
+  // Export comments to Excel
+  const handleExportExcel = async () => {
+    if (!comments || comments.length === 0) {
+      toast.error("没有可导出的评论数据");
+      return;
+    }
+
+    try {
+      // 动态导入 xlsx
+      const XLSX = await import('xlsx');
+      
+      // 准备数据
+      const exportData = comments.map((comment: any) => ({
+        '评论 ID': comment.replyId,
+        '推文 ID': comment.tweetId,
+        '作者名称': comment.authorName,
+        '作者用户名': `@${comment.authorHandle}`,
+        '评论内容': comment.text,
+        '发布时间': comment.createdAt ? new Date(comment.createdAt).toLocaleString('zh-CN') : '',
+        '点赞数': comment.likeCount || 0,
+        '情绪类型': comment.sentiment || '未分析',
+        '价值评分': comment.valueScore || '',
+        'AI 摘要': comment.summary || '',
+        '分析时间': comment.analyzedAt ? new Date(comment.analyzedAt).toLocaleString('zh-CN') : '',
+      }));
+
+      // 创建工作表
+      const ws = XLSX.utils.json_to_sheet(exportData);
+      
+      // 设置列宽
+      ws['!cols'] = [
+        { wch: 20 }, // 评论 ID
+        { wch: 20 }, // 推文 ID
+        { wch: 15 }, // 作者名称
+        { wch: 15 }, // 作者用户名
+        { wch: 50 }, // 评论内容
+        { wch: 20 }, // 发布时间
+        { wch: 8 },  // 点赞数
+        { wch: 10 }, // 情绪类型
+        { wch: 10 }, // 价值评分
+        { wch: 30 }, // AI 摘要
+        { wch: 20 }, // 分析时间
+      ];
+
+      // 创建工作簿
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, '评论数据');
+
+      // 生成文件名
+      const timestamp = new Date().toISOString().slice(0, 10);
+      const filename = `X评论导出_${activeAccount || 'all'}_${timestamp}.xlsx`;
+
+      // 下载文件
+      XLSX.writeFile(wb, filename);
+      
+      toast.success(`已导出 ${exportData.length} 条评论`);
+    } catch (error) {
+      console.error('Export error:', error);
+      toast.error('导出失败，请重试');
+    }
+  };
+
   return (
     <div className="flex flex-col lg:flex-row min-h-[calc(100vh-3.5rem)]">
       {/* Left Sidebar - Filters */}
@@ -212,7 +305,7 @@ export function MonitorDashboard() {
             <TabsContent value="username" className="space-y-3 mt-3">
               <div className="flex gap-2">
                 <Input
-                  placeholder="输入 X 用户名（如 BitgetWalletCN）"
+                  placeholder="输入 X 用户名"
                   value={usernameInput}
                   onChange={(e) => setUsernameInput(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && addAccount()}
@@ -277,14 +370,14 @@ export function MonitorDashboard() {
                 <div className="text-center py-6 text-muted-foreground">
                   <Users className="w-8 h-8 mx-auto mb-2 opacity-50" />
                   <p className="text-sm">添加 X 用户名开始监控</p>
-                  <p className="text-xs mt-1">例如: BitgetWalletCN</p>
+                  <p className="text-xs mt-1"></p>
                 </div>
               )}
             </TabsContent>
 
             <TabsContent value="tweet" className="space-y-3 mt-3">
               <Input
-                placeholder="输入 Tweet ID..."
+                placeholder="输入 Tweet ID"
                 value={tweetId}
                 onChange={(e) => setTweetId(e.target.value)}
                 className="h-9"
@@ -315,6 +408,69 @@ export function MonitorDashboard() {
                 ))}
               </SelectContent>
             </Select>
+            
+            {/* Custom Time Range Picker */}
+            {timeRange === 'custom' && (
+              <div className="space-y-3 p-3 bg-muted/50 rounded-lg mt-2">
+                {/* Start Date */}
+                <div className="space-y-1">
+                  <Label className="text-xs">开始时间</Label>
+                  <div className="flex gap-2">
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <Button variant="outline" size="sm" className="flex-1 justify-start text-left font-normal h-8">
+                          <CalendarIcon className="mr-2 h-3 w-3" />
+                          {customStartDate ? format(customStartDate, "yyyy-MM-dd", { locale: zhCN }) : "选择日期"}
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-auto p-0" align="start">
+                        <Calendar
+                          mode="single"
+                          selected={customStartDate}
+                          onSelect={setCustomStartDate}
+                          initialFocus
+                        />
+                      </PopoverContent>
+                    </Popover>
+                    <Input
+                      type="time"
+                      value={customStartTime}
+                      onChange={(e) => setCustomStartTime(e.target.value)}
+                      className="w-24 h-8 text-xs"
+                    />
+                  </div>
+                </div>
+                
+                {/* End Date */}
+                <div className="space-y-1">
+                  <Label className="text-xs">结束时间</Label>
+                  <div className="flex gap-2">
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <Button variant="outline" size="sm" className="flex-1 justify-start text-left font-normal h-8">
+                          <CalendarIcon className="mr-2 h-3 w-3" />
+                          {customEndDate ? format(customEndDate, "yyyy-MM-dd", { locale: zhCN }) : "选择日期"}
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-auto p-0" align="start">
+                        <Calendar
+                          mode="single"
+                          selected={customEndDate}
+                          onSelect={setCustomEndDate}
+                          initialFocus
+                        />
+                      </PopoverContent>
+                    </Popover>
+                    <Input
+                      type="time"
+                      value={customEndTime}
+                      onChange={(e) => setCustomEndTime(e.target.value)}
+                      className="w-24 h-8 text-xs"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           <Separator />
@@ -495,6 +651,16 @@ export function MonitorDashboard() {
               分析
               {showAnalytics ? <ChevronUp className="w-3 h-3 ml-1" /> : <ChevronDown className="w-3 h-3 ml-1" />}
             </Button>
+
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleExportExcel}
+              disabled={!comments || comments.length === 0}
+            >
+              <Download className="w-4 h-4 mr-1" />
+              导出
+            </Button>
           </div>
         </div>
 
@@ -515,7 +681,7 @@ export function MonitorDashboard() {
                 <p className="text-lg font-medium">暂无评论数据</p>
                 <p className="text-sm mt-2">
                   {monitorMode === 'username' 
-                    ? '请添加 X 用户名并点击播放按钮开始获取评论' 
+                    ? '请添加用户名并点击播放按钮开始获取评论' 
                     : '请输入 Tweet ID 查看评论'}
                 </p>
                 <p className="text-xs mt-4 text-muted-foreground/70">

@@ -20,6 +20,7 @@ import {
   getConfig,
   setConfig,
   getAllConfigs,
+  getAllCommentsForExport,
 } from "./db";
 import { scrapeUserTweets, scrapeTweetReplies, scrapeUserComments as playwrightScrapeUserComments } from "./twitterScraper";
 
@@ -80,11 +81,22 @@ export const appRouter = router({
         return await getCommentsWithAnalysis(input);
       }),
 
+    // 导出评论数据
+    exportData: publicProcedure
+      .input(z.object({
+        tweetId: z.string().optional(),
+        startTime: z.date().optional(),
+        endTime: z.date().optional(),
+      }))
+      .query(async ({ input }) => {
+        const comments = await getAllCommentsForExport(input);
+        return comments;
+      }),
+
     stats: publicProcedure
       .input(z.object({ tweetId: z.string().optional() }))
       .query(async ({ input }) => {
         const stats = await getCommentStats(input.tweetId);
-        
         const sentimentCounts: Record<string, number> = {
           positive: 0, neutral: 0, negative: 0, anger: 0, sarcasm: 0,
         };

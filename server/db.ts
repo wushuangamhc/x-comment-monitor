@@ -345,3 +345,52 @@ export async function getAllConfigs(): Promise<SystemConfig[]> {
   
   return await db.select().from(systemConfig);
 }
+
+// ============ Export Functions ============
+export async function getAllCommentsForExport(filter?: CommentFilter) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const conditions = [];
+  
+  if (filter?.tweetId) {
+    conditions.push(eq(rawComments.tweetId, filter.tweetId));
+  }
+  if (filter?.startTime) {
+    conditions.push(gte(rawComments.createdAt, filter.startTime));
+  }
+  if (filter?.endTime) {
+    conditions.push(lte(rawComments.createdAt, filter.endTime));
+  }
+
+  let query = db
+    .select({
+      replyId: rawComments.replyId,
+      tweetId: rawComments.tweetId,
+      authorId: rawComments.authorId,
+      authorName: rawComments.authorName,
+      authorHandle: rawComments.authorHandle,
+      text: rawComments.text,
+      createdAt: rawComments.createdAt,
+      likeCount: rawComments.likeCount,
+      replyTo: rawComments.replyTo,
+      sentiment: analyzedComments.sentiment,
+      valueScore: analyzedComments.valueScore,
+      valueType: analyzedComments.valueType,
+      summary: analyzedComments.summary,
+      analyzedAt: analyzedComments.analyzedAt,
+    })
+    .from(rawComments)
+    .leftJoin(analyzedComments, eq(rawComments.replyId, analyzedComments.replyId));
+
+  if (conditions.length > 0) {
+    query = query.where(and(...conditions)) as typeof query;
+  }
+
+  const results = await query;
+  
+  // Sort by time desc
+  results.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  
+  return results;
+}
