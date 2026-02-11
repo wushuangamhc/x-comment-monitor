@@ -137,28 +137,41 @@ export async function getUserByOpenId(openId: string) {
 }
 
 // ============ Raw Comments Functions ============
+function normalizeCorruptedMediaTags(text: string): string {
+  if (!text) return text;
+  return text
+    .replace(/\[鍥剧墖\]/g, "[图片]")
+    .replace(/\[瑙嗛\]/g, "[视频]")
+    .replace(/\[閾炬帴\]/g, "[链接]");
+}
+
 export async function insertRawComment(comment: InsertRawComment): Promise<void> {
+  const normalizedComment: InsertRawComment = {
+    ...comment,
+    text: normalizeCorruptedMediaTags(comment.text),
+  };
   const db = await getDb();
   if (!db) {
     if (process.env.NODE_ENV === "development") {
-      const existing = devRawCommentStore.find((c) => c.replyId === comment.replyId);
+      const existing = devRawCommentStore.find((c) => c.replyId === normalizedComment.replyId);
       if (existing) {
-        existing.likeCount = comment.likeCount ?? existing.likeCount;
+        existing.text = normalizedComment.text;
+        existing.likeCount = normalizedComment.likeCount ?? existing.likeCount;
         existing.fetchedAt = new Date();
         return;
       }
 
       devRawCommentStore.push({
         id: devRawCommentSeq++,
-        replyId: comment.replyId,
-        tweetId: comment.tweetId,
-        authorId: comment.authorId,
-        authorName: comment.authorName,
-        authorHandle: comment.authorHandle,
-        text: comment.text,
-        createdAt: comment.createdAt,
-        likeCount: comment.likeCount ?? 0,
-        replyTo: comment.replyTo ?? null,
+        replyId: normalizedComment.replyId,
+        tweetId: normalizedComment.tweetId,
+        authorId: normalizedComment.authorId,
+        authorName: normalizedComment.authorName,
+        authorHandle: normalizedComment.authorHandle,
+        text: normalizedComment.text,
+        createdAt: normalizedComment.createdAt,
+        likeCount: normalizedComment.likeCount ?? 0,
+        replyTo: normalizedComment.replyTo ?? null,
         fetchedAt: new Date(),
       });
       return;
@@ -166,9 +179,10 @@ export async function insertRawComment(comment: InsertRawComment): Promise<void>
     throw new Error("Database not available");
   }
   
-  await db.insert(rawComments).values(comment).onDuplicateKeyUpdate({
+  await db.insert(rawComments).values(normalizedComment).onDuplicateKeyUpdate({
     set: {
-      likeCount: comment.likeCount,
+      text: normalizedComment.text,
+      likeCount: normalizedComment.likeCount,
       fetchedAt: new Date(),
     },
   });
@@ -206,6 +220,13 @@ export interface CommentFilter {
   analyzed?: boolean;
 }
 
+function hasCustomValueScoreRange(minValueScore?: number, maxValueScore?: number): boolean {
+  if (minValueScore === undefined && maxValueScore === undefined) return false;
+  const min = minValueScore ?? 0;
+  const max = maxValueScore ?? 1;
+  return min > 0 || max < 1;
+}
+
 export async function getCommentsWithAnalysis(filter: CommentFilter) {
   const db = await getDb();
   if (!db) {
@@ -229,11 +250,11 @@ export async function getCommentsWithAnalysis(filter: CommentFilter) {
         authorId: raw.authorId,
         authorName: raw.authorName,
         authorHandle: raw.authorHandle,
-        text: raw.text,
+        text: normalizeCorruptedMediaTags(raw.text),
         createdAt: raw.createdAt,
         likeCount: raw.likeCount,
         replyTo: raw.replyTo,
-        replyToText: parent?.text ?? null,
+        replyToText: parent?.text ? normalizeCorruptedMediaTags(parent.text) : null,
         sentiment: analysis?.sentiment ?? null,
         valueScore: analysis?.valueScore ?? null,
         valueType: analysis?.valueType ?? null,
@@ -241,6 +262,9 @@ export async function getCommentsWithAnalysis(filter: CommentFilter) {
         analyzedAt: analysis?.analyzedAt ?? null,
       };
     });
+
+    // Treat only real replies as comments; root tweets are used for context/filtering.
+    rows = rows.filter((r) => r.replyId !== r.tweetId);
 
     if (filter.tweetId) rows = rows.filter((r) => r.tweetId === filter.tweetId);
     if (filter.authorHandles && filter.authorHandles.length > 0) {
@@ -256,15 +280,16 @@ export async function getCommentsWithAnalysis(filter: CommentFilter) {
     if (filter.analyzed === true) rows = rows.filter((r) => r.sentiment !== null);
     if (filter.analyzed === false) rows = rows.filter((r) => r.sentiment === null);
 
+    const applyValueScoreFilter = hasCustomValueScoreRange(filter.minValueScore, filter.maxValueScore);
     if (filter.analyzed !== false) {
       if (filter.sentiments && filter.sentiments.length > 0) {
         const s = new Set(filter.sentiments);
         rows = rows.filter((r) => r.sentiment && s.has(r.sentiment));
       }
-      if (filter.minValueScore !== undefined) {
+      if (applyValueScoreFilter && filter.minValueScore !== undefined) {
         rows = rows.filter((r) => Number(r.valueScore ?? -1) >= filter.minValueScore!);
       }
-      if (filter.maxValueScore !== undefined) {
+      if (applyValueScoreFilter && filter.maxValueScore !== undefined) {
         rows = rows.filter((r) => Number(r.valueScore ?? 2) <= filter.maxValueScore!);
       }
     }
@@ -284,6 +309,7 @@ export async function getCommentsWithAnalysis(filter: CommentFilter) {
 
   const conditions = [];
   const parentTweet = alias(rawComments, "parentTweet");
+  conditions.push(sql`${rawComments.replyId} <> ${rawComments.tweetId}`);
   
   if (filter.tweetId) {
     conditions.push(eq(rawComments.tweetId, filter.tweetId));
@@ -311,15 +337,16 @@ export async function getCommentsWithAnalysis(filter: CommentFilter) {
     conditions.push(isNull(analyzedComments.replyId));
   }
 
+  const applyValueScoreFilter = hasCustomValueScoreRange(filter.minValueScore, filter.maxValueScore);
   // Only apply sentiment and score filters if we are NOT explicitly looking for unanalyzed comments
   if (filter.analyzed !== false) {
     if (filter.sentiments && filter.sentiments.length > 0) {
       conditions.push(inArray(analyzedComments.sentiment, filter.sentiments as any));
     }
-    if (filter.minValueScore !== undefined) {
+    if (applyValueScoreFilter && filter.minValueScore !== undefined) {
       conditions.push(gte(analyzedComments.valueScore, String(filter.minValueScore)));
     }
-    if (filter.maxValueScore !== undefined) {
+    if (applyValueScoreFilter && filter.maxValueScore !== undefined) {
       conditions.push(lte(analyzedComments.valueScore, String(filter.maxValueScore)));
     }
   }
@@ -381,7 +408,12 @@ export async function getCommentsWithAnalysis(filter: CommentFilter) {
   
   query = query.limit(limit).offset(offset) as typeof query;
 
-  return await query;
+  const rows = await query;
+  return rows.map((row: any) => ({
+    ...row,
+    text: normalizeCorruptedMediaTags(String(row.text ?? "")),
+    replyToText: row.replyToText == null ? null : normalizeCorruptedMediaTags(String(row.replyToText)),
+  }));
 }
 
 export async function getCommentStats(tweetId?: string, rootTweetAuthor?: string) {
@@ -395,6 +427,7 @@ export async function getCommentStats(tweetId?: string, rootTweetAuthor?: string
     }
 
     let rows = devRawCommentStore;
+    rows = rows.filter((r) => r.replyId !== r.tweetId);
     if (tweetId) rows = rows.filter((r) => r.tweetId === tweetId);
     if (rootTweetAuthor) {
       rows = rows.filter((r) => rootAuthorByTweetId.get(r.tweetId) === rootTweetAuthor);
@@ -412,6 +445,7 @@ export async function getCommentStats(tweetId?: string, rootTweetAuthor?: string
 
   const rootTweet = alias(rawComments, "rootTweet");
   const conditions = [];
+  conditions.push(sql`${rawComments.replyId} <> ${rawComments.tweetId}`);
   if (tweetId) conditions.push(eq(rawComments.tweetId, tweetId));
   if (rootTweetAuthor) conditions.push(eq(rootTweet.authorHandle, rootTweetAuthor));
 
@@ -457,6 +491,7 @@ export async function getTopCommenters(tweetId?: string, limit: number = 10) {
 
     const counts = new Map<string, { authorHandle: string; authorName: string; count: number }>();
     for (const r of devRawCommentStore) {
+      if (r.replyId === r.tweetId) continue;
       if (tweetId && r.tweetId !== tweetId) continue;
       const current = counts.get(r.authorHandle);
       if (current) {
@@ -475,7 +510,9 @@ export async function getTopCommenters(tweetId?: string, limit: number = 10) {
       .slice(0, limit);
   }
 
-  const conditions = tweetId ? [eq(rawComments.tweetId, tweetId)] : [];
+  const conditions = tweetId
+    ? [eq(rawComments.tweetId, tweetId), sql`${rawComments.replyId} <> ${rawComments.tweetId}`]
+    : [sql`${rawComments.replyId} <> ${rawComments.tweetId}`];
 
   let query = db
     .select({
@@ -693,7 +730,7 @@ export async function getAllCommentsForExport(filter?: CommentFilter) {
       authorId: r.authorId,
       authorName: r.authorName,
       authorHandle: r.authorHandle,
-      text: r.text,
+      text: normalizeCorruptedMediaTags(String(r.text ?? "")),
       createdAt: r.createdAt,
       likeCount: r.likeCount,
       replyTo: r.replyTo,
@@ -707,6 +744,7 @@ export async function getAllCommentsForExport(filter?: CommentFilter) {
 
   const conditions = [];
   const rootTweet = alias(rawComments, "rootTweet");
+  conditions.push(sql`${rawComments.replyId} <> ${rawComments.tweetId}`);
 
   if (filter?.tweetId) {
     conditions.push(eq(rawComments.tweetId, filter.tweetId));
@@ -727,14 +765,15 @@ export async function getAllCommentsForExport(filter?: CommentFilter) {
     conditions.push(isNull(analyzedComments.replyId));
   }
 
+  const applyValueScoreFilter = hasCustomValueScoreRange(filter?.minValueScore, filter?.maxValueScore);
   if (filter?.analyzed !== false) {
     if (filter?.sentiments && filter.sentiments.length > 0) {
       conditions.push(inArray(analyzedComments.sentiment, filter.sentiments as any));
     }
-    if (filter?.minValueScore !== undefined) {
+    if (applyValueScoreFilter && filter?.minValueScore !== undefined) {
       conditions.push(gte(analyzedComments.valueScore, String(filter.minValueScore)));
     }
-    if (filter?.maxValueScore !== undefined) {
+    if (applyValueScoreFilter && filter?.maxValueScore !== undefined) {
       conditions.push(lte(analyzedComments.valueScore, String(filter.maxValueScore)));
     }
   }

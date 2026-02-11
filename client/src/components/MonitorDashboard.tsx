@@ -29,6 +29,7 @@ type SortOption = 'time_desc' | 'time_asc' | 'value_desc' | 'likes_desc';
 type TimeRange = '10m' | '1h' | '24h' | '7d' | 'custom';
 type Sentiment = 'positive' | 'neutral' | 'negative' | 'anger' | 'sarcasm';
 type MonitorMode = 'username' | 'tweet';
+type ReplySortMode = 'recent' | 'top';
 
 const SENTIMENTS: { value: Sentiment; label: string; color: string }[] = [
   { value: 'positive', label: '支持', color: 'bg-green-500' },
@@ -110,6 +111,8 @@ export function MonitorDashboard() {
   const [isFetching, setIsFetching] = useState(false);
   const [fetchingTweetId, setFetchingTweetId] = useState<string | null>(null); // Tweet ID 模式下正在采集的 ID，用于进度轮询
   const [maxTweetsToFetch, setMaxTweetsToFetch] = useState(30); // 单次采集推文数，可 10/30/50/100，长期跑可多次点采集
+  const [replySortMode, setReplySortMode] = useState<ReplySortMode>('recent');
+  const [expandFoldedReplies, setExpandFoldedReplies] = useState(false);
   const [fetchProgress, setFetchProgress] = useState<{
     stage: string;
     message: string;
@@ -183,12 +186,17 @@ export function MonitorDashboard() {
     return undefined;
   }, [timeRange, customEndDate, customEndTime]);
 
+  // Treat full [0,1] as "no value-score filter" to avoid hiding unanalyzed comments.
+  const hasCustomValueScoreRange = valueRange[0] > 0 || valueRange[1] < 1;
+
   const utils = trpc.useUtils();
   // Smart fetch mutation - 定义在 list 查询前，便于用 isPending 驱动采集期间短间隔轮询
   const smartFetch = trpc.twitter.smartFetch.useMutation({
     onSuccess: (data) => {
       if (data.success) {
-        const method = data.method === 'playwright' ? 'Playwright 自爬' : 'Apify API';
+        const method = (data.method === 'playwright' || data.method === 'puppeteer')
+          ? 'Puppeteer 自爬'
+          : 'Apify API';
         toast.success(data.message || `使用 ${method} 成功获取 ${data.commentsCount} 条评论`);
         void utils.comments.list.invalidate();
         void utils.comments.stats.invalidate();
@@ -231,8 +239,8 @@ export function MonitorDashboard() {
     tweetId: tweetId || undefined,
     rootTweetAuthor: monitorMode === 'username' && activeAccount ? activeAccount : undefined,
     sentiments: selectedSentiments.length > 0 ? selectedSentiments : undefined,
-    minValueScore: valueRange[0],
-    maxValueScore: valueRange[1],
+    minValueScore: hasCustomValueScoreRange ? valueRange[0] : undefined,
+    maxValueScore: hasCustomValueScoreRange ? valueRange[1] : undefined,
     startTime: timeFilter,
     sortBy,
     limit: 100,
@@ -327,12 +335,14 @@ export function MonitorDashboard() {
       currentTweet: 0,
       totalTweets: maxTweetsToFetch,
     });
-    // 使用智能采集，优先 Playwright，备选 Apify；可多次运行拉取更多历史（单次最多 100 条推文）
+    // 使用智能采集，优先 Puppeteer，备选 Apify；可多次运行拉取更多历史（单次最多 100 条推文）
     smartFetch.mutate({ 
       username, 
       maxTweets: maxTweetsToFetch, 
-      maxRepliesPerTweet: 0, // 0 = 不限制，每条推文评论最多 300 条
-      preferredMethod: 'playwright' 
+      maxRepliesPerTweet: 20,
+      preferredMethod: 'auto',
+      replySortMode,
+      expandFoldedReplies,
     });
   };
 
@@ -345,8 +355,8 @@ export function MonitorDashboard() {
         startTime: timeFilter,
         endTime: timeFilterEnd,
         sentiments: selectedSentiments.length > 0 ? selectedSentiments : undefined,
-        minValueScore: valueRange[0],
-        maxValueScore: valueRange[1],
+        minValueScore: hasCustomValueScoreRange ? valueRange[0] : undefined,
+        maxValueScore: hasCustomValueScoreRange ? valueRange[1] : undefined,
         analyzed: showUnanalyzedOnly ? false : undefined,
       });
       if (!list || list.length === 0) {
@@ -514,7 +524,11 @@ export function MonitorDashboard() {
                   }
                   setFetchingTweetId(id);
                   setFetchProgress({ stage: 'init', message: '正在初始化...', tweetsFound: 0, repliesFound: 0, currentTweet: 1, totalTweets: 1 });
-                  scrapeByTweetId.mutate({ tweetId: id });
+                  scrapeByTweetId.mutate({
+                    tweetId: id,
+                    replySortMode,
+                    expandFoldedReplies,
+                  });
                 }}
                 disabled={scrapeByTweetId.isPending || !tweetId.trim()}
               >
@@ -526,6 +540,35 @@ export function MonitorDashboard() {
               </Button>
             </TabsContent>
           </Tabs>
+
+          <div className="space-y-3">
+            <p className="text-xs text-muted-foreground font-medium">采集设置</p>
+            <div className="space-y-2">
+              <label className="text-xs text-muted-foreground">评论排序</label>
+              <Select value={replySortMode} onValueChange={(v) => setReplySortMode(v as ReplySortMode)}>
+                <SelectTrigger className="h-8">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="recent">Recent</SelectItem>
+                  <SelectItem value="top">Top</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex items-start space-x-2">
+              <Checkbox
+                id="expand-folded-replies"
+                checked={expandFoldedReplies}
+                onCheckedChange={(checked) => setExpandFoldedReplies(!!checked)}
+              />
+              <label
+                htmlFor="expand-folded-replies"
+                className="text-sm leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
+              >
+                展开折叠评论（楼中楼）
+              </label>
+            </div>
+          </div>
 
           <Separator />
 

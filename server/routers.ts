@@ -37,6 +37,7 @@ import {
   closeBrowser,
   type ScrapeConfig,
   type ScrapeProgress,
+  type ReplySortMode,
 } from "./twitterScraper";
 import { clearScrapeProgress, getScrapeProgress, setScrapeProgress } from "./scrapeProgressStore";
 import { getPlaywrightStatus } from "./ensurePlaywright";
@@ -80,6 +81,259 @@ const monitorTargetSchema = z.object({
   targetName: z.string().optional(),
   targetHandle: z.string().optional(),
 });
+
+const replySortModeEnum = z.enum(["recent", "top"]);
+
+function normalizeErrorMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+function isBrowserLaunchFailure(error: unknown): boolean {
+  const message = normalizeErrorMessage(error);
+  return /Browser launch failed|Failed to launch the browser process|libnss3\.so|Browser initialization timed out/i.test(
+    message,
+  );
+}
+
+function toApifySort(sortMode: ReplySortMode): "Latest" | "Top" {
+  return sortMode === "top" ? "Top" : "Latest";
+}
+
+async function scrapeTweetRepliesViaApify(params: {
+  tweetId: string;
+  apifyToken: string;
+  maxReplies: number;
+  progressKey: string;
+  sortMode?: ReplySortMode;
+}): Promise<{
+  success: boolean;
+  method: "apify";
+  error?: string;
+  commentsCount: number;
+  message?: string;
+}> {
+  const { tweetId, apifyToken, maxReplies, progressKey, sortMode = "recent" } = params;
+  const apifySort = toApifySort(sortMode);
+
+  const setApifyProgress = (stage: ScrapeProgress["stage"], message: string, repliesFound = 0) => {
+    setScrapeProgress(progressKey, {
+      stage,
+      message,
+      tweetsFound: 1,
+      repliesFound,
+      currentTweet: 1,
+      totalTweets: 1,
+      currentAccount: 0,
+      totalAccounts: 1,
+    });
+  };
+
+  const saveRootTweet = async (tweet: {
+    id: string;
+    text: string;
+    authorName: string;
+    authorHandle: string;
+    createdAt: string;
+    likeCount: number;
+  }) => {
+    try {
+      await insertRawComment({
+        replyId: tweet.id,
+        tweetId: tweet.id,
+        authorId: "unknown",
+        authorName: tweet.authorName,
+        authorHandle: tweet.authorHandle,
+        text: tweet.text,
+        createdAt: new Date(tweet.createdAt),
+        likeCount: tweet.likeCount,
+        replyTo: undefined,
+      });
+    } catch (_) {
+      // Ignore duplicate errors.
+    }
+  };
+
+  const saveReply = async (reply: {
+    id: string;
+    text: string;
+    authorId: string;
+    authorName: string;
+    authorHandle: string;
+    createdAt: string;
+    likeCount: number;
+    replyTo: string;
+  }) => {
+    try {
+      await insertRawComment({
+        replyId: reply.id,
+        tweetId: reply.replyTo,
+        authorId: reply.authorId,
+        authorName: reply.authorName,
+        authorHandle: reply.authorHandle,
+        text: reply.text,
+        createdAt: new Date(reply.createdAt),
+        likeCount: reply.likeCount,
+        replyTo: reply.replyTo,
+      });
+    } catch (_) {
+      // Ignore duplicate errors.
+    }
+  };
+
+  try {
+    setApifyProgress("loading", `Puppeteer unavailable, falling back to Apify for tweet ${tweetId}...`, 0);
+
+    const runResponse = await fetch(
+      `https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite/runs?token=${apifyToken}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          searchTerms: [`conversation_id:${tweetId}`],
+          sort: apifySort,
+          maxItems: maxReplies + 1,
+        }),
+      },
+    );
+
+    if (!runResponse.ok) {
+      const errorText = await runResponse.text();
+      return {
+        success: false,
+        method: "apify",
+        error: `Failed to start Apify run: ${errorText}`,
+        commentsCount: 0,
+      };
+    }
+
+    const runPayload = await runResponse.json();
+    const runId = runPayload.data?.id as string | undefined;
+    const datasetId = runPayload.data?.defaultDatasetId as string | undefined;
+    if (!runId || !datasetId) {
+      return {
+        success: false,
+        method: "apify",
+        error: "Apify run was created but runId/datasetId is missing",
+        commentsCount: 0,
+      };
+    }
+
+    setApifyProgress("loading", "Apify run started, waiting for completion...", 0);
+
+    let runStatus = "RUNNING";
+    for (let attempt = 0; attempt < 80 && runStatus === "RUNNING"; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      const statusResponse = await fetch(`https://api.apify.com/v2/actor-runs/${runId}?token=${apifyToken}`);
+      const statusPayload = await statusResponse.json();
+      runStatus = statusPayload.data?.status || "FAILED";
+    }
+
+    if (runStatus !== "SUCCEEDED") {
+      return {
+        success: false,
+        method: "apify",
+        error: `Apify run did not succeed: ${runStatus}`,
+        commentsCount: 0,
+      };
+    }
+
+    const datasetResponse = await fetch(`https://api.apify.com/v2/datasets/${datasetId}/items?token=${apifyToken}`);
+    const items = await datasetResponse.json();
+    if (!Array.isArray(items) || items.length === 0) {
+      return {
+        success: false,
+        method: "apify",
+        error: "No tweet/reply items returned by Apify for this tweet ID",
+        commentsCount: 0,
+      };
+    }
+
+    const toStringSafe = (value: unknown, fallback = "") =>
+      typeof value === "string" ? value : value == null ? fallback : String(value);
+
+    let savedReplies = 0;
+    let rootInserted = false;
+
+    for (const item of items) {
+      const itemId = toStringSafe(item?.id).trim();
+      if (!itemId) continue;
+
+      const conversationId = toStringSafe(item?.conversationId ?? item?.conversation_id);
+      const inReplyTo = toStringSafe(item?.inReplyToStatusId ?? item?.in_reply_to_status_id ?? item?.replyToStatusId);
+      const sameConversation = conversationId === tweetId || inReplyTo === tweetId || itemId === tweetId;
+      if (!sameConversation) continue;
+
+      const text = toStringSafe(item?.text ?? item?.fullText ?? item?.full_text);
+      const authorName = toStringSafe(item?.author?.name ?? item?.userName ?? item?.user?.name, "Unknown");
+      const authorHandle = toStringSafe(
+        item?.author?.userName ?? item?.author?.screenName ?? item?.userScreenName ?? item?.user?.screen_name,
+        "unknown",
+      );
+      const authorId = toStringSafe(item?.author?.id ?? item?.userId ?? item?.user?.id, "unknown");
+      const likeCount = Number(item?.likeCount ?? item?.favoriteCount ?? item?.favorite_count ?? 0);
+      const createdAtRaw = item?.createdAt ?? item?.created_at ?? new Date().toISOString();
+      const createdAt = new Date(createdAtRaw);
+      const createdAtISO = Number.isNaN(createdAt.getTime()) ? new Date().toISOString() : createdAt.toISOString();
+
+      if (itemId === tweetId) {
+        await saveRootTweet({
+          id: itemId,
+          text,
+          authorName,
+          authorHandle,
+          createdAt: createdAtISO,
+          likeCount: Number.isFinite(likeCount) ? likeCount : 0,
+        });
+        rootInserted = true;
+        continue;
+      }
+
+      await saveReply({
+        id: itemId,
+        text,
+        authorId,
+        authorName,
+        authorHandle,
+        createdAt: createdAtISO,
+        likeCount: Number.isFinite(likeCount) ? likeCount : 0,
+        replyTo: inReplyTo || tweetId,
+      });
+
+      savedReplies++;
+      if (savedReplies % 20 === 0) {
+        setApifyProgress("fetching_replies", `Fetched ${savedReplies} replies via Apify...`, savedReplies);
+      }
+    }
+
+    if (!rootInserted) {
+      await saveRootTweet({
+        id: tweetId,
+        text: "",
+        authorName: "Unknown",
+        authorHandle: "unknown",
+        createdAt: new Date().toISOString(),
+        likeCount: 0,
+      });
+    }
+
+    setApifyProgress("complete", `Completed via Apify: ${savedReplies} replies`, savedReplies);
+    return {
+      success: true,
+      method: "apify",
+      commentsCount: savedReplies,
+      message: `Apify fetched ${savedReplies} replies`,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      method: "apify",
+      error: normalizeErrorMessage(error),
+      commentsCount: 0,
+    };
+  }
+}
 
 export const appRouter = router({
   system: systemRouter,
@@ -454,7 +708,7 @@ ${commentTexts}
         return { success: true };
       }),
 
-    // Playwright 状态查询
+    // Puppeteer 运行状态查询（保留旧路由名兼容）
     getPlaywrightStatus: protectedProcedure.query(() => {
       return getPlaywrightStatus();
     }),
@@ -737,7 +991,7 @@ ${commentTexts}
         }
       }),
 
-    // Playwright 自爬功能 - 免费
+    // Puppeteer 自爬功能 - 免费（保留旧路由名兼容）
     scrapeWithPlaywright: protectedProcedure
       .input(z.object({
         username: z.string(),
@@ -829,10 +1083,20 @@ ${commentTexts}
 
     // 仅爬取指定 Tweet ID 下全部评论
     scrapeByTweetId: protectedProcedure
-      .input(z.object({ tweetId: z.string().min(1, "请输入 Tweet ID") }))
+      .input(
+        z.object({
+          tweetId: z.string().min(1, "请输入 Tweet ID"),
+          replySortMode: replySortModeEnum.default("recent"),
+          expandFoldedReplies: z.boolean().default(false),
+        }),
+      )
       .mutation(async ({ input }) => {
         const xCookies = await getConfig('X_COOKIES');
-        const progressKey = `tweet:${input.tweetId}`;
+        const apifyToken = await getConfig('APIFY_API_TOKEN');
+        const tweetId = input.tweetId.trim();
+        const maxReplies = 300;
+        const progressKey = `tweet:${tweetId}`;
+        let playwrightError: string | null = null;
         try {
           clearScrapeProgress(progressKey);
           const onTweet = async (tweet: { id: string; text: string; authorName: string; authorHandle: string; createdAt: string; likeCount: number }) => {
@@ -870,11 +1134,15 @@ ${commentTexts}
             }
           };
           const scrapePromise = scrapeRepliesByTweetId(
-            input.tweetId.trim(),
+            tweetId,
             xCookies || undefined,
             (p) => setScrapeProgress(progressKey, p),
             onReply,
-            onTweet
+            onTweet,
+            {
+              sortMode: input.replySortMode,
+              expandFoldedReplies: input.expandFoldedReplies,
+            },
           );
           const hardTimeoutMs = 10 * 60 * 1000;
           const hardTimeout = new Promise<never>((_, reject) =>
@@ -882,7 +1150,24 @@ ${commentTexts}
           );
           const result = await Promise.race([scrapePromise, hardTimeout]);
           if (!result.success) {
-            return { success: false, error: result.error || '采集失败', commentsCount: 0 };
+            playwrightError = result.error || 'Puppeteer scrape failed';
+            if (apifyToken) {
+              const apifyResult = await scrapeTweetRepliesViaApify({
+                tweetId,
+                apifyToken,
+                maxReplies,
+                progressKey,
+                sortMode: input.replySortMode,
+              });
+              if (apifyResult.success) return apifyResult;
+              return {
+                success: false,
+                method: 'apify',
+                error: `${apifyResult.error || 'Apify scrape failed'} (Puppeteer error: ${playwrightError})`,
+                commentsCount: 0,
+              };
+            }
+            return { success: false, method: 'puppeteer', error: result.error || '采集失败', commentsCount: 0 };
           }
           return {
             success: true,
@@ -890,6 +1175,23 @@ ${commentTexts}
             message: `已采集 ${result.replies?.length ?? 0} 条评论，可在此页查看与导出`,
           };
         } catch (error: any) {
+          const errorMessage = normalizeErrorMessage(error);
+          if (apifyToken && isBrowserLaunchFailure(errorMessage)) {
+            const apifyResult = await scrapeTweetRepliesViaApify({
+              tweetId,
+              apifyToken,
+              maxReplies,
+              progressKey,
+              sortMode: input.replySortMode,
+            });
+            if (apifyResult.success) return apifyResult;
+            return {
+              success: false,
+              method: 'apify',
+              error: `${apifyResult.error || 'Apify scrape failed'} (Puppeteer error: ${errorMessage})`,
+              commentsCount: 0,
+            };
+          }
           setScrapeProgress(progressKey, {
             stage: 'error',
             message: String(error?.message || error),
@@ -904,21 +1206,23 @@ ${commentTexts}
         }
       }),
 
-    // 智能采集 - 优先使用 Playwright，Apify 作为备选
+    // 智能采集 - 优先使用 Puppeteer，Apify 作为备选
     smartFetch: protectedProcedure
       .input(z.object({
         username: z.string(),
         maxTweets: z.number().min(1).max(100).default(30),
         maxRepliesPerTweet: z.number().min(0).max(300).default(0),
-        preferredMethod: z.enum(['playwright', 'apify', 'auto']).default('auto'),
+        preferredMethod: z.enum(['puppeteer', 'playwright', 'apify', 'auto']).default('auto'),
+        replySortMode: replySortModeEnum.default("recent"),
+        expandFoldedReplies: z.boolean().default(false),
       }))
       .mutation(async ({ input }) => {
         const xCookies = await getConfig('X_COOKIES');
         const apifyToken = await getConfig('APIFY_API_TOKEN');
         let playwrightError: string | null = null;
 
-        // Auto mode: try Playwright first, then Apify
-        if (input.preferredMethod === 'auto' || input.preferredMethod === 'playwright') {
+        // Auto mode: try Puppeteer first, then Apify
+        if (input.preferredMethod === 'auto' || input.preferredMethod === 'playwright' || input.preferredMethod === 'puppeteer') {
           try {
             clearScrapeProgress(input.username);
             // 边爬边显：先写入根推文再写回复
@@ -965,7 +1269,11 @@ ${commentTexts}
               (p) => setScrapeProgress(input.username, p),
               onReply,
               onTweet,
-              input.maxRepliesPerTweet
+              input.maxRepliesPerTweet,
+              {
+                sortMode: input.replySortMode,
+                expandFoldedReplies: input.expandFoldedReplies,
+              },
             );
             // Hard timeout to prevent endless spinner on UI (10 minutes)
             const hardTimeoutMs = 10 * 60 * 1000;
@@ -998,27 +1306,27 @@ ${commentTexts}
 
               return {
                 success: true,
-                method: 'playwright',
+                method: 'puppeteer',
                 commentsCount: insertedReplyCount,
                 tweetsCount: result.tweets?.length || 0,
                 message: insertedReplyCount > 0
-                  ? `使用 Playwright 成功采集 ${insertedReplyCount} 条评论`
-                  : `使用 Playwright 完成采集，但未获取到评论`,
+                  ? `使用 Puppeteer 成功采集 ${insertedReplyCount} 条评论`
+                  : `使用 Puppeteer 完成采集，但未获取到评论`,
               };
             }
 
-            // If Playwright failed and we're in auto mode, try Apify
+            // If Puppeteer failed and we're in auto mode, try Apify
             if (!result.success) {
-              playwrightError = result.error || 'Playwright 采集失败';
+              playwrightError = result.error || 'Puppeteer 采集失败';
             }
 
             if (input.preferredMethod === 'auto' && apifyToken) {
-              console.log(`Playwright 采集失败 (${playwrightError})，尝试使用 Apify...`);
+              console.log(`Puppeteer 采集失败 (${playwrightError})，尝试使用 Apify...`);
             } else if (!result.success) {
               return {
                 success: false,
-                method: 'playwright',
-                error: result.error || 'Playwright 采集失败',
+                method: 'puppeteer',
+                error: result.error || 'Puppeteer 采集失败',
                 commentsCount: 0,
               };
             }
@@ -1034,10 +1342,10 @@ ${commentTexts}
               currentAccount: 0,
               totalAccounts: 1,
             });
-            if (input.preferredMethod === 'playwright') {
+            if (input.preferredMethod === 'playwright' || input.preferredMethod === 'puppeteer') {
               return {
                 success: false,
-                method: 'playwright',
+                method: 'puppeteer',
                 error: String(err),
                 commentsCount: 0,
               };
@@ -1076,7 +1384,7 @@ ${commentTexts}
               if (errorText.includes("Monthly usage hard limit exceeded")) {
                 let errorMsg = "Apify 本月额度已耗尽，无法继续采集。请升级 Apify 套餐或等待下月重置。";
                 if (playwrightError) {
-                  errorMsg += ` (注：Playwright 自爬也失败了: ${playwrightError})`;
+                  errorMsg += ` (注：Puppeteer 自爬也失败了: ${playwrightError})`;
                 }
                 return { success: false, method: 'apify', error: errorMsg, commentsCount: 0 };
               }
@@ -1123,6 +1431,7 @@ ${commentTexts}
             }
 
             let totalComments = 0;
+            const apifyReplySort = toApifySort(input.replySortMode);
             const tweetIds = tweets.slice(0, input.maxTweets).map((t: any) => t.id);
             console.log(`[Apify] 开始获取 ${tweetIds.length} 条推文的评论...`);
 
@@ -1138,7 +1447,7 @@ ${commentTexts}
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                       searchTerms: [`conversation_id:${tweetId}`],
-                      sort: 'Latest',
+                      sort: apifyReplySort,
                       maxItems: input.maxRepliesPerTweet,
                     }),
                   }

@@ -185,7 +185,7 @@ export default function Settings() {
     await setConfigMutation.mutateAsync({
       key: "X_COOKIES",
       value: validCookies[0],
-      description: "Primary X/Twitter Cookie for Playwright scraping",
+      description: "Primary X/Twitter Cookie for Puppeteer scraping",
     });
 
     // 保存完整列表
@@ -277,7 +277,7 @@ export default function Settings() {
                   采集优先级说明
                 </h3>
                 <p className="text-sm text-green-700 dark:text-green-300">
-                  系统会<strong>优先使用 Playwright 自爬</strong>（免费），如果失败则自动切换到 Apify API（付费）。
+                  系统会<strong>优先使用 Puppeteer 自爬</strong>（免费），如果失败则自动切换到 Apify API（付费）。
                   支持配置多个 X 账号 Cookie，系统会自动轮换使用以降低单账号被封风险。
                 </p>
               </div>
@@ -415,7 +415,7 @@ export default function Settings() {
                     <div className="flex items-center gap-2 p-3 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg border border-yellow-200 dark:border-yellow-800">
                       <AlertCircle className="w-4 h-4 text-yellow-600" />
                       <p className="text-sm text-yellow-700 dark:text-yellow-300">
-                        未配置 X Cookie，Playwright 自爬可能无法获取完整数据
+                        未配置 X Cookie，Puppeteer 自爬可能无法获取完整数据
                       </p>
                     </div>
                   )}

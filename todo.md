@@ -96,38 +96,9 @@
 - [x] 排查 Apify 数据未同步到网页的问题
 - [x] 修复数据导入逻辑（添加完整的 Apify 采集流程：获取推文 -> 等待完成 -> 获取评论 -> 导入数据库）
 
-## GitHub 代码同步
-- [x] 从 GitHub 拉取用户本地修改的代码
-- [x] 移植 rootTweetAuthor 过滤功能到 MySQL 版本
-- [x] 移植 scrapeByTweetId（按推文 ID 采集评论）
-- [x] 移植 getScrapeProgress（实时采集进度）
-- [x] 移植 closeBrowser 功能
-- [x] 移植边爬边显功能（250ms 轮询）
-- [x] 移植多账号 Cookie 管理（Settings 页面）
-- [x] 移植 MonitorDashboard 改进（Tweet ID 模式、进度显示）
-- [x] 移植 CommentCard 改进（replyToText 显示）
-- [x] 移植 CookieGuide 教程页面
-- [x] 修复 AnalyticsPanel 方法名引用错误
-- [x] 修复 valueType 类型错误
-- [x] 确保数据库表完整（MySQL schema 保持不变）
-
-## Bug 修复 - 线上环境 Playwright 不可用
-- [x] 添加 Playwright 浏览器可用性检测
-- [x] 线上环境自动安装 Chromium（不再降级，而是自动修复）
-- [x] 安装失败时给出明确错误提示
-
-## 线上环境 Playwright 支持
-- [x] 创建 Chromium 自动检测与安装脚本 (ensurePlaywright.ts)
-- [x] 在服务器启动流程中集成自动安装 (start 脚本 + 运行时检测)
-- [x] twitterScraper 中添加启动前检测逻辑 (getBrowser 函数)
-
-## Bug 修复 - 线上 Service Unavailable
-- [x] 移除 start 脚本中阻塞式 playwright install
-- [x] 改用系统自带 Chromium (/usr/bin/chromium-browser)
-- [x] 后台异步检测 + 自动发现系统浏览器
-
-## GitHub 代码同步（第二次 - Puppeteer 迁移）
-- [x] 拉取 GitHub 最新代码（用户本地 Puppeteer 迁移）
-- [x] 同步业务文件到 Manus 项目（保持 MySQL 兼容）
-- [x] 验证构建和运行正常
+## GitHub 代码同步（第三次 - Puppeteer 迁移 + 新功能）
+- [x] 拉取 GitHub 最新代码（commit 6e91b25）
+- [x] 同步变更到 Manus 项目（twitterScraper/routers/db/前端组件）
+- [x] 安装 puppeteer-core + @sparticuz/chromium 依赖
+- [x] 验证 TS 编译、build 成功、服务器运行正常
 - [x] 保存 checkpoint 并发布

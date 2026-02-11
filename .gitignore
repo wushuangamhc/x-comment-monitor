@@ -105,6 +105,3 @@ temp/
 *.db
 *.sqlite
 *.sqlite3
-
-# Manus internal
-.manus/

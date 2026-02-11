@@ -17,14 +17,8 @@ const redirectToLoginIfUnauthorized = (error: unknown) => {
   const isUnauthorized = error.message === UNAUTHED_ERR_MSG;
 
   if (!isUnauthorized) return;
-  const loginUrl = getLoginUrl();
-  if (loginUrl === "#") {
-    console.error(
-      "[Auth] OAuth login is not configured. Please set VITE_OAUTH_PORTAL_URL and VITE_APP_ID."
-    );
-    return;
-  }
-  window.location.href = loginUrl;
+
+  window.location.href = getLoginUrl();
 };
 
 queryClient.getQueryCache().subscribe(event => {

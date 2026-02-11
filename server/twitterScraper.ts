@@ -13,6 +13,36 @@ async function elTextContent(handle: ElementHandle<Element> | null): Promise<str
   return (await handle.evaluate((el) => (el as HTMLElement).textContent)) ?? '';
 }
 
+// Extract status id from a tweet article. Prefer the anchor that contains <time>.
+async function extractStatusIdFromArticle(
+  articleEl: ElementHandle<Element>,
+  rootTweetId?: string
+): Promise<string | null> {
+  try {
+    return await articleEl.evaluate((el, rootId) => {
+      const anchors = Array.from(el.querySelectorAll('a[href*="/status/"]')) as HTMLAnchorElement[];
+      const ids = anchors
+        .map((a) => (a.getAttribute('href') || '').match(/status\/(\d+)/)?.[1] || null)
+        .filter((id): id is string => !!id);
+
+      if (ids.length === 0) return null;
+
+      const timeAnchor = anchors.find((a) => a.querySelector('time'));
+      const timeId = (timeAnchor?.getAttribute('href') || '').match(/status\/(\d+)/)?.[1] || null;
+      if (timeId && (!rootId || timeId !== rootId || ids.length === 1)) return timeId;
+
+      if (rootId) {
+        const nonRoot = ids.find((id) => id !== rootId);
+        if (nonRoot) return nonRoot;
+      }
+
+      return ids[ids.length - 1] || null;
+    }, rootTweetId ?? null);
+  } catch {
+    return null;
+  }
+}
+
 
 /** Context-like wrapper: creates pages with viewport/cookies set (Puppeteer has no context options). */
 export interface ScraperContext {
@@ -85,7 +115,7 @@ interface ScrapeResult {
   progress?: ScrapeProgress;
 }
 
-// 采集进度
+// 閲囬泦杩涘害
 export interface ScrapeProgress {
   stage: 'init' | 'loading' | 'fetching_tweets' | 'fetching_replies' | 'complete' | 'error';
   message: string;
@@ -97,7 +127,7 @@ export interface ScrapeProgress {
   totalAccounts: number;
 }
 
-// 爬取速度配置
+// 鐖彇閫熷害閰嶇疆
 export interface ScrapeConfig {
   pageLoadDelay: number;
   scrollDelay: number;
@@ -106,7 +136,14 @@ export interface ScrapeConfig {
   randomDelayRange: [number, number];
 }
 
-// 默认配置 - 保守模式
+export type ReplySortMode = 'recent' | 'top';
+
+export interface ReplyScrapeOptions {
+  sortMode?: ReplySortMode;
+  expandFoldedReplies?: boolean;
+}
+
+// 榛樿閰嶇疆 - 淇濆畧妯″紡
 export const DEFAULT_SCRAPE_CONFIG: ScrapeConfig = {
   pageLoadDelay: 3000,
   scrollDelay: 2500,
@@ -115,7 +152,7 @@ export const DEFAULT_SCRAPE_CONFIG: ScrapeConfig = {
   randomDelayRange: [1000, 3000],
 };
 
-// 预设配置
+// 棰勮閰嶇疆
 export const SCRAPE_PRESETS = {
   ultraSlow: {
     pageLoadDelay: 5000,
@@ -149,7 +186,7 @@ export const SCRAPE_PRESETS = {
 
 let currentConfig: ScrapeConfig = { ...DEFAULT_SCRAPE_CONFIG };
 
-// 多账号 Cookie 管理
+// 澶氳处鍙?Cookie 绠＄悊
 let accountCookies: string[] = [];
 let currentAccountIndex = 0;
 
@@ -234,29 +271,49 @@ async function clickByText(page: Page, selector: string, textPattern: string, fl
   }
 }
 
+const EXPAND_REPLY_BUTTON_PATTERN =
+  'Show more replies|Show more|Show additional replies|Show hidden replies|more replies|View more|Load more|See more|Show probable spam|显示更多|更多回复|查看更多回复|展开更多回复|可能为垃圾';
+
+async function switchReplySortTab(page: Page, sortMode: ReplySortMode): Promise<boolean> {
+  const pattern =
+    sortMode === 'top'
+      ? 'Top|Most relevant|热门|最相关'
+      : 'Recent|Latest|Most recent|最新|最近';
+  if (await clickByText(page, 'a[role="tab"]', pattern)) return true;
+  return clickByText(page, 'div[role="tab"]', pattern);
+}
+
 // Helper to find the Y position of the "More tweets" / recommendation divider (Puppeteer: no text selectors, use evaluate)
 async function getCutoffY(page: Page): Promise<number> {
   try {
     const y = await page.evaluate(() => {
       const primary = document.querySelector('[data-testid="primaryColumn"]');
       if (!primary) return Infinity;
-      const texts = [
-        'More tweets', 'Discover more', 'You might like', '更多推文', '发现更多', '推荐内容',
-        'Recommended for you', 'Recommended', 'For you', 'Trending', 'Who to follow', '关注',
+
+      const markerPatterns = [
+        /^More posts$/i,
+        /^More tweets$/i,
+        /^Discover more$/i,
+        /^You might like$/i,
+        /^Related posts$/i,
+        /^更多推文$/,
+        /^更多帖子$/,
+        /^发现更多$/,
+        /^你可能喜欢$/,
+        /^相关帖子$/,
       ];
-      const walk = (el: Element): number => {
-        const t = (el.textContent || '').trim();
-        if (texts.some(txt => t === txt || t.toLowerCase().includes('recommended') || t.includes('推荐'))) {
-          const r = el.getBoundingClientRect();
-          return r.top + window.scrollY;
-        }
-        for (const c of Array.from(el.children)) {
-          const y = walk(c);
-          if (y !== Infinity) return y;
-        }
-        return Infinity;
-      };
-      return walk(primary);
+
+      let cutoff = Infinity;
+      const nodes = primary.querySelectorAll('div[role="heading"], h1, h2, div[dir="auto"], span');
+      for (const el of Array.from(nodes)) {
+        const text = (el.textContent || '').trim();
+        if (!markerPatterns.some((pattern) => pattern.test(text))) continue;
+        const rect = (el as Element).getBoundingClientRect();
+        const absY = rect.top + window.scrollY;
+        if (absY <= window.scrollY + 250) continue;
+        if (absY < cutoff) cutoff = absY;
+      }
+      return cutoff;
     });
     return typeof y === 'number' ? y : Infinity;
   } catch {
@@ -264,7 +321,22 @@ async function getCutoffY(page: Page): Promise<number> {
   }
 }
 
-// 检测推文/回复中的图片、视频，返回占位文本 [图片][视频]
+// Detect login wall on tweet detail pages where replies are gated.
+async function hasReplyLoginWall(page: Page): Promise<boolean> {
+  try {
+    return await page.evaluate(() => {
+      const text = document.body?.innerText || '';
+      const hasLoginPrompt = /(log in|sign in|登录|登入|注册|创建账号)/i.test(text);
+      const hasReplyEntry = /(查看\s*\d+\s*条回复|view\s*\d+\s*repl(y|ies))/i.test(text);
+      const tweetCards = document.querySelectorAll('article[data-testid="tweet"]').length;
+      return hasLoginPrompt && hasReplyEntry && tweetCards <= 2;
+    });
+  } catch {
+    return false;
+  }
+}
+
+// Detect media in tweet/reply and append placeholders like [图片] [视频].
 async function getMediaPlaceholders(articleEl: import('puppeteer-core').ElementHandle): Promise<string> {
   let s = '';
   try {
@@ -439,16 +511,16 @@ async function createContext(cookies?: string): Promise<ScraperContext> {
   return wrapper;
 }
 
-// 进度回调类型
+// 杩涘害鍥炶皟绫诲瀷
 export type ProgressCallback = (progress: ScrapeProgress) => void;
 
-// 单条评论回调：每爬到一条评论时调用，便于「边爬边显」
+// 鍗曟潯璇勮鍥炶皟锛氭瘡鐖埌涓€鏉¤瘎璁烘椂璋冪敤锛屼究浜庛€岃竟鐖竟鏄俱€?
 export type OnReplyCallback = (reply: Reply) => void | Promise<void>;
-// 根推文回调：在抓取某条推文的回复之前调用，便于先写入父推文，列表按 rootTweetAuthor 过滤时能立即看到新回复
+// 鏍规帹鏂囧洖璋冿細鍦ㄦ姄鍙栨煇鏉℃帹鏂囩殑鍥炲涔嬪墠璋冪敤锛屼究浜庡厛鍐欏叆鐖舵帹鏂囷紝鍒楄〃鎸?rootTweetAuthor 杩囨护鏃惰兘绔嬪嵆鐪嬪埌鏂板洖澶?
 export type OnTweetCallback = (tweet: Tweet) => void | Promise<void>;
 
-// 主要爬取函数 - 支持进度回调、单条评论回调和根推文回调
-// maxRepliesPerTweet: 每条推文最多拉取的评论数；0 或不传表示不限制，直到连续多轮滚动无新评论为止
+// 涓昏鐖彇鍑芥暟 - 鏀寔杩涘害鍥炶皟銆佸崟鏉¤瘎璁哄洖璋冨拰鏍规帹鏂囧洖璋?
+// maxRepliesPerTweet: 姣忔潯鎺ㄦ枃鏈€澶氭媺鍙栫殑璇勮鏁帮紱0 鎴栦笉浼犺〃绀轰笉闄愬埗锛岀洿鍒拌繛缁杞粴鍔ㄦ棤鏂拌瘎璁轰负姝?
 export async function scrapeUserComments(
   username: string,
   maxTweets: number = 10,
@@ -456,12 +528,15 @@ export async function scrapeUserComments(
   onProgress?: ProgressCallback,
   onReply?: OnReplyCallback,
   onTweet?: OnTweetCallback,
-  maxRepliesPerTweet: number = 0
+  maxRepliesPerTweet: number = 0,
+  options: ReplyScrapeOptions = {}
 ): Promise<ScrapeResult> {
-  // 使用传入的 cookies 或轮换账号
+  // 浣跨敤浼犲叆鐨?cookies 鎴栬疆鎹㈣处鍙?
   const useCookies = cookies || getNextAccountCookie();
   const accountIndex = cookies ? 0 : getCurrentAccountIndex();
   const totalAccounts = cookies ? 1 : Math.max(1, getAccountCount());
+  const replySortMode = options.sortMode ?? 'recent';
+  const expandFoldedReplies = options.expandFoldedReplies === true;
   
   const progress: ScrapeProgress = {
     stage: 'init',
@@ -496,11 +571,11 @@ export async function scrapeUserComments(
       updateProgress({ message: `检测到代理配置: ${proxy}` });
       await wait(500);
     } else {
-      updateProgress({ message: '未检测到代理，将直连尝试...' });
+      updateProgress({ message: '未检测到代理，将尝试直连...' });
       await wait(500);
     }
 
-    updateProgress({ message: '正在启动浏览器核心...' });
+    updateProgress({ message: '正在启动浏览器内核...' });
     console.log('[Scraper] Calling createContext...');
     
     // Add a race timeout for context creation specifically
@@ -521,17 +596,17 @@ export async function scrapeUserComments(
     await wait(500);
     page = await context.newPage();
     
-    updateProgress({ message: `正在导航至 @${username} 主页...` });
+    updateProgress({ message: `正在导航到 @${username} 主页...` });
     console.log(`[Scraper] Navigating to https://x.com/${username}`);
     
-    // 访问用户主页（使用重试 + 更长超时，x.com 经常较慢或偶发超时）
+    // 璁块棶鐢ㄦ埛涓婚〉锛堜娇鐢ㄩ噸璇?+ 鏇撮暱瓒呮椂锛寈.com 缁忓父杈冩參鎴栧伓鍙戣秴鏃讹級
     try {
       await gotoWithRetry(page, `https://x.com/${username}`, { waitUntil: 'domcontentloaded', timeout: 60000 }, 3);
     } catch (navError: any) {
       const msg = String(navError?.message || navError);
       if (msg.includes('ERR_CONNECTION_CLOSED') || msg.includes('ERR_CONNECTION_REFUSED') || msg.includes('net::ERR')) {
         throw new Error(
-          '无法连接 X (x.com)：连接被关闭或拒绝。若在本机运行，请检查网络/防火墙或设置代理（HTTPS_PROXY）；若在云服务器（如 Railway）上运行，X 可能封禁机房 IP，采集需在本地运行或配置可访问 X 的代理。'
+          '无法连接 X (x.com)：连接被关闭或拒绝。请检查网络或代理配置后重试。'
         );
       }
       throw navError;
@@ -556,7 +631,7 @@ export async function scrapeUserComments(
 
     await wait(currentConfig.pageLoadDelay);
 
-    // 检查是否需要登录
+    // 妫€鏌ユ槸鍚﹂渶瑕佺櫥褰?
     try {
         const loginButton = await page.waitForSelector('a[href*="/login"]', { timeout: 3000 }).catch(() => null);
         const signInText = await page.evaluate(() =>
@@ -574,7 +649,7 @@ export async function scrapeUserComments(
 
     updateProgress({ stage: 'fetching_tweets', message: '正在获取推文列表...' });
 
-    // 获取推文
+    // 鑾峰彇鎺ㄦ枃
     const tweets: Tweet[] = [];
     let scrollCount = 0;
     const maxScrolls = Math.ceil(maxTweets / 3) + 5;
@@ -601,15 +676,13 @@ export async function scrapeUserComments(
         try {
           // Check if this tweet is below the "More tweets" line
           const box = await el.boundingBox();
-          if (box && box.y > cutoffY) {
+          if (box && Number.isFinite(cutoffY) && box.y > cutoffY) {
               console.log('[Scraper] Reached "More tweets" section, stopping profile scrape.');
               reachedEnd = true;
               break; // Stop processing current batch
           }
 
-          const tweetLink = await el.$('a[href*="/status/"]');
-          const href = await elGetAttribute(tweetLink ?? null, 'href');
-          const tweetId = href?.match(/status\/(\d+)/)?.[1];
+          const tweetId = await extractStatusIdFromArticle(el);
           
           if (!tweetId) {
              console.log('[Scraper] Skipped tweet element: No ID found');
@@ -622,7 +695,7 @@ export async function scrapeUserComments(
 
           const textEl = await el.$('[data-testid="tweetText"]');
           let text = await elTextContent(textEl ?? null) || '';
-          // 无正文时用卡片标题占位
+          // 鏃犳鏂囨椂鐢ㄥ崱鐗囨爣棰樺崰浣?
           if (!text.trim()) {
              const card = await el.$('[data-testid="card.wrapper"]');
              if (card) {
@@ -641,7 +714,7 @@ export async function scrapeUserComments(
           const timeEl = await el.$('time');
           const datetime = (await elGetAttribute(timeEl ?? null, 'datetime')) || new Date().toISOString();
           
-          // 获取互动数据
+          // 鑾峰彇浜掑姩鏁版嵁
           const likeEl = await el.$('[data-testid="like"] span');
           const replyEl = await el.$('[data-testid="reply"] span');
           const retweetEl = await el.$('[data-testid="retweet"] span');
@@ -688,7 +761,7 @@ export async function scrapeUserComments(
       message: `共找到 ${tweets.length} 条推文，开始获取评论...`
     });
 
-    // 获取每条推文的评论
+    // 鑾峰彇姣忔潯鎺ㄦ枃鐨勮瘎璁?
     const allReplies: Reply[] = [];
     
     for (let i = 0; i < tweets.length; i++) {
@@ -698,7 +771,7 @@ export async function scrapeUserComments(
         message: `正在获取第 ${i + 1}/${tweets.length} 条推文的评论...`
       });
 
-      // 先写入根推文，这样按 rootTweetAuthor 过滤的列表能立即显示即将抓取的回复（边爬边显）
+      // 鍏堝啓鍏ユ牴鎺ㄦ枃锛岃繖鏍锋寜 rootTweetAuthor 杩囨护鐨勫垪琛ㄨ兘绔嬪嵆鏄剧ず鍗冲皢鎶撳彇鐨勫洖澶嶏紙杈圭埇杈规樉锛?
       if (onTweet) {
         try {
           await Promise.resolve(onTweet(tweet));
@@ -724,19 +797,25 @@ export async function scrapeUserComments(
         
         await wait(currentConfig.pageLoadDelay);
 
-        // 优先切换到「最新」回复
+        if (await hasReplyLoginWall(page)) {
+          const errorMsg = '当前会话无法展开评论（登录墙拦截）。请在设置中重新配置有效的 X Cookie 后重试。';
+          updateProgress({ stage: 'error', message: errorMsg });
+          return { success: false, error: errorMsg, progress };
+        }
+
+        // Prefer requested reply sort tab before scraping.
         try {
-          if (await clickByText(page, 'a[role="tab"]', 'Latest|最新')) {
+          if (await switchReplySortTab(page, replySortMode)) {
             await wait(2000);
-            console.log('[Scraper] Switched to Latest replies.');
+            console.log(`[Scraper] Switched reply sort tab to ${replySortMode}.`);
           }
         } catch (_) { /* ignore */ }
 
-        // 滚动加载评论：无新评论则停 或 达到 maxRepliesPerTweet
+        // 婊氬姩鍔犺浇璇勮锛氭棤鏂拌瘎璁哄垯鍋?鎴?杈惧埌 maxRepliesPerTweet
         const repliesCountBeforeThisTweet = allReplies.length;
         let consecutiveScrollsWithNoNew = 0;
-        const maxScrollsWithNoNew = 8; // 连续 8 轮无新评论才停（慢网络时更稳）
-        let scrollBudget = 500; // 单条推文最多滚动轮数（防止死循环）
+        const maxScrollsWithNoNew = 8; // 杩炵画 8 杞棤鏂拌瘎璁烘墠鍋滐紙鎱㈢綉缁滄椂鏇寸ǔ锛?
+        let scrollBudget = 500; // 鍗曟潯鎺ㄦ枃鏈€澶氭粴鍔ㄨ疆鏁帮紙闃叉姝诲惊鐜級
         
         while (consecutiveScrollsWithNoNew < maxScrollsWithNoNew && scrollBudget > 0) {
           scrollBudget--;
@@ -751,17 +830,15 @@ export async function scrapeUserComments(
             try {
               // Check boundary
               const box = await el.boundingBox();
-              if (box && box.y > cutoffY) {
+              if (box && Number.isFinite(cutoffY) && box.y > cutoffY) {
                   console.log('[Scraper] Reached "More tweets" recommendations, stopping reply scrape.');
                   reachedEnd = true;
                   break;
               }
 
-              const replyLink = await el.$('a[href*="/status/"]');
-              const href = await elGetAttribute(replyLink ?? null, 'href');
-              const replyId = href?.match(/status\/(\d+)/)?.[1];
+              const replyId = await extractStatusIdFromArticle(el, tweet.id);
               
-              // 跳过原推文
+              // 璺宠繃鍘熸帹鏂?
               if (!replyId || replyId === tweet.id || allReplies.some(r => r.id === replyId)) continue;
 
               const textEl = await el.$('[data-testid="tweetText"]');
@@ -796,7 +873,7 @@ export async function scrapeUserComments(
               };
               allReplies.push(reply);
 
-              // 边爬边显：每抓到一条就通知（例如写入 DB，前端轮询即可看到）
+              // 杈圭埇杈规樉锛氭瘡鎶撳埌涓€鏉″氨閫氱煡锛堜緥濡傚啓鍏?DB锛屽墠绔疆璇㈠嵆鍙湅鍒帮級
               if (onReply) {
                 try {
                   await Promise.resolve(onReply(reply));
@@ -816,37 +893,39 @@ export async function scrapeUserComments(
 
           if (reachedEnd) break;
 
-          // 若设置了每条推文评论上限且已达标，则停止
+          // 鑻ヨ缃簡姣忔潯鎺ㄦ枃璇勮涓婇檺涓斿凡杈炬爣锛屽垯鍋滄
           const repliesForThisTweet = allReplies.length - repliesCountBeforeThisTweet;
           if (maxRepliesPerTweet > 0 && repliesForThisTweet >= maxRepliesPerTweet) {
             console.log(`[Scraper] Reached maxRepliesPerTweet=${maxRepliesPerTweet} for this tweet, stopping.`);
             break;
           }
 
-          // 本轮是否有新评论：无则累计，连续多轮无新则视为到底
+          // 鏈疆鏄惁鏈夋柊璇勮锛氭棤鍒欑疮璁★紝杩炵画澶氳疆鏃犳柊鍒欒涓哄埌搴?
           if (allReplies.length === countBeforeScroll) {
             consecutiveScrollsWithNoNew++;
           } else {
             consecutiveScrollsWithNoNew = 0;
           }
 
-          // Try to find "Show more replies" button
-          try {
-            const clicked = await clickByText(page, 'div[role="button"]', 'Show more replies|显示更多回复|Show probable spam');
-            if (clicked) {
-              console.log('[Scraper] Clicking "Show more replies" button...');
-              await wait(2000);
-              scrollBudget += 20;
+          if (expandFoldedReplies) {
+            // Optionally expand folded replies / spam-filtered branches.
+            try {
+              const clicked = await clickByText(page, 'div[role="button"]', EXPAND_REPLY_BUTTON_PATTERN);
+              if (clicked) {
+                console.log('[Scraper] Clicking "show more replies" button...');
+                await wait(2000);
+                scrollBudget += 20;
+              }
+            } catch (e) {
+              // Ignore button errors
             }
-          } catch (e) {
-            // Ignore button errors
           }
 
           await page.evaluate(() => window.scrollBy(0, 800));
           await wait(currentConfig.scrollDelay);
         }
 
-        // 推文间延迟
+        // 鎺ㄦ枃闂村欢杩?
         if (i < tweets.length - 1) {
           await wait(currentConfig.betweenTweetsDelay);
         }
@@ -883,14 +962,34 @@ export async function scrapeUserComments(
   }
 }
 
-/** 仅爬取指定 Tweet ID 下的全部回复（全量，无高赞过滤） */
+/** 浠呯埇鍙栨寚瀹?Tweet ID 涓嬬殑鍏ㄩ儴鍥炲锛堝叏閲忥紝鏃犻珮璧炶繃婊わ級 */
 export async function scrapeRepliesByTweetId(
   tweetId: string,
   cookies?: string,
   onProgress?: ProgressCallback,
   onReply?: OnReplyCallback,
-  onTweet?: OnTweetCallback
+  onTweet?: OnTweetCallback,
+  options: ReplyScrapeOptions = {}
 ): Promise<ScrapeResult> {
+  const isDevMode = process.env.NODE_ENV !== 'production';
+  const replyScrollDelayMs = Number(
+    process.env.SCRAPER_REPLY_SCROLL_DELAY_MS ?? (isDevMode ? 1200 : 4800)
+  );
+  const maxScrollsWithNoNewLimit = Number(
+    process.env.SCRAPER_MAX_SCROLLS_NO_NEW ?? (isDevMode ? 10 : 40)
+  );
+  const initialScrollBudget = Number(
+    process.env.SCRAPER_SCROLL_BUDGET ?? (isDevMode ? 120 : 1800)
+  );
+  const maxBottomNoNew = Number(
+    process.env.SCRAPER_BOTTOM_NO_NEW ?? (isDevMode ? 6 : 20)
+  );
+  const maxBottomRounds = Number(
+    process.env.SCRAPER_BOTTOM_ROUNDS ?? (isDevMode ? 30 : 120)
+  );
+  const replySortMode = options.sortMode ?? 'recent';
+  const expandFoldedReplies = options.expandFoldedReplies === true;
+
   const useCookies = cookies || getNextAccountCookie();
   const progress: ScrapeProgress = {
     stage: 'init',
@@ -939,12 +1038,12 @@ export async function scrapeRepliesByTweetId(
         updateProgress({ stage: 'error', message: `连接失败: ${msg.slice(0, 80)}` });
         return {
           success: false,
-          error: '连接被关闭或超时，请检查网络/代理后重试；若在中国大陆可尝试使用代理访问 X/Twitter。',
+          error: '连接被关闭或超时，请检查网络或代理后重试。',
           progress,
         };
       }
     }
-    // 给页面时间渲染（X 为 SPA，domcontentloaded 后仍会异步渲染推文）
+    // 缁欓〉闈㈡椂闂存覆鏌擄紙X 涓?SPA锛宒omcontentloaded 鍚庝粛浼氬紓姝ユ覆鏌撴帹鏂囷級
     await wait(4000);
     const tweetSelector = 'article[data-testid="tweet"]';
     try {
@@ -956,9 +1055,9 @@ export async function scrapeRepliesByTweetId(
         return { success: false, error: '当前未登录或 Cookie 已失效，请在设置中重新配置 X Cookie 后再试', progress };
       }
       if (/this tweet (is )?unavailable|推文不可用|no longer available/i.test(bodyText)) {
-        return { success: false, error: '该推文不可用（可能已删除或仅限特定用户）', progress };
+        return { success: false, error: '该推文不可用（可能已删除或仅限特定用户可见）', progress };
       }
-      return { success: false, error: '无法加载该推文，请检查 ID、网络，并确认已配置有效 X Cookie', progress };
+      return { success: false, error: '无法加载该推文，请检查 Tweet ID、网络，并确认已配置有效 X Cookie', progress };
     }
     await wait(getScrapeConfig().pageLoadDelay);
 
@@ -967,9 +1066,7 @@ export async function scrapeRepliesByTweetId(
       return { success: false, error: '页面上未找到推文', progress };
     }
     const first = articles[0];
-    const tweetLink = await first.$('a[href*="/status/"]');
-    const href = await elGetAttribute(tweetLink ?? null, 'href');
-    const parsedId = href?.match(/status\/(\d+)/)?.[1] || tweetId;
+    const parsedId = (await extractStatusIdFromArticle(first, tweetId)) || tweetId;
     const textEl = await first.$('[data-testid="tweetText"]');
     let text = await elTextContent(textEl ?? null) || '';
     if (!text.trim()) {
@@ -1009,24 +1106,29 @@ export async function scrapeRepliesByTweetId(
       try { await Promise.resolve(onTweet(rootTweet)); } catch (e) { console.error('[Scraper] onTweet error:', e); }
     }
 
-    updateProgress({ stage: 'fetching_replies', message: '正在获取该推文下全部评论...' });
+    if (await hasReplyLoginWall(page)) {
+      const errorMsg = '当前会话无法展开评论（登录墙拦截）。请在设置中重新配置有效的 X Cookie 后重试。';
+      updateProgress({ stage: 'error', message: errorMsg });
+      return { success: false, error: errorMsg, progress };
+    }
+
+    updateProgress({
+      stage: 'fetching_replies',
+      message: `正在获取该推文下全部评论（排序: ${replySortMode === 'top' ? 'Top' : 'Recent'}）...`,
+    });
     try {
-      if (await clickByText(page, 'a[role="tab"]', 'Latest|最新')) await wait(2000);
+      if (await switchReplySortTab(page, replySortMode)) await wait(2000);
     } catch (_) {}
 
     const allReplies: Reply[] = [];
     const seenReplyIds = new Set<string>([rootTweet.id]);
     let lastReportedCount = 0;
-    const replyScrollDelayMs = 4800; // 评论区滚动后多等，网络慢时懒加载也能出来
-
     const processArticleList = async (replyElements: Awaited<ReturnType<Page['$$']>>, cutoffY: number) => {
       for (const el of replyElements) {
         try {
           const box = await el.boundingBox();
-          if (box && box.y > cutoffY) break;
-          const replyLink = await el.$('a[href*="/status/"]');
-          const hrefR = await elGetAttribute(replyLink ?? null, 'href');
-          const replyId = hrefR?.match(/status\/(\d+)/)?.[1];
+          if (box && Number.isFinite(cutoffY) && box.y > cutoffY) break;
+          const replyId = await extractStatusIdFromArticle(el, rootTweet.id);
           if (!replyId || seenReplyIds.has(replyId)) continue;
 
           seenReplyIds.add(replyId);
@@ -1066,13 +1168,14 @@ export async function scrapeRepliesByTweetId(
       }
     };
 
-    // 第一阶段：常规滚动 + 狂点「显示更多」（参数偏保守，网络慢也能采全）
+    // 绗竴闃舵锛氬父瑙勬粴鍔?+ 鐙傜偣銆屾樉绀烘洿澶氥€嶏紙鍙傛暟鍋忎繚瀹堬紝缃戠粶鎱篃鑳介噰鍏級
     let consecutiveScrollsWithNoNew = 0;
-    const maxScrollsWithNoNew = 40;
-    let scrollBudget = 1800;
+    let scrollBudget = initialScrollBudget;
+    let firstPhaseRounds = 0;
 
-    while (consecutiveScrollsWithNoNew < maxScrollsWithNoNew && scrollBudget > 0) {
+    while (consecutiveScrollsWithNoNew < maxScrollsWithNoNewLimit && scrollBudget > 0) {
       scrollBudget--;
+      firstPhaseRounds++;
       const countBeforeScroll = allReplies.length;
       const replyElements = await page.$$('article[data-testid="tweet"]');
       const cutoffY = await getCutoffY(page);
@@ -1087,17 +1190,24 @@ export async function scrapeRepliesByTweetId(
       } else {
         consecutiveScrollsWithNoNew = 0;
       }
+      if (firstPhaseRounds % 5 === 0) {
+        updateProgress({
+          repliesFound: allReplies.length,
+          message: `正在抓取评论... 第1阶段 ${firstPhaseRounds}轮，连续无新增 ${consecutiveScrollsWithNoNew} 轮`,
+        });
+      }
 
-      // 尽量点光所有「显示更多」类按钮
-      for (let i = 0; i < 8; i++) {
-        try {
-          const pattern = 'Show more|显示更多|more replies|更多回复|View more|Load more|See more|probable spam|可能为垃圾';
-          if (await clickByText(page, 'div[role="button"]', pattern)) {
-            await wait(4000);
-            scrollBudget += 20;
-            consecutiveScrollsWithNoNew = 0;
-          } else break;
-        } catch (_) { break; }
+      if (expandFoldedReplies) {
+        // Optionally expand folded replies / spam-filtered branches.
+        for (let i = 0; i < 8; i++) {
+          try {
+            if (await clickByText(page, 'div[role="button"]', EXPAND_REPLY_BUTTON_PATTERN)) {
+              await wait(4000);
+              scrollBudget += 20;
+              consecutiveScrollsWithNoNew = 0;
+            } else break;
+          } catch (_) { break; }
+        }
       }
 
       const articles = await page.$$('article[data-testid="tweet"]');
@@ -1120,11 +1230,10 @@ export async function scrapeRepliesByTweetId(
       await wait(replyScrollDelayMs);
     }
 
-    // 第二阶段：反复滚到页面最底部再采集，专门收尾懒加载（多轮多等，网络慢也能采全）
-    updateProgress({ message: `已获取 ${allReplies.length} 条，继续滚到底部查漏...` });
+    // 第二阶段：滚动到底部做查漏补抓
+    updateProgress({ message: `已获取 ${allReplies.length} 条，继续滚动到底部查漏...` });
     let bottomNoNewCount = 0;
-    const maxBottomNoNew = 20;
-    for (let round = 0; round < 120 && bottomNoNewCount < maxBottomNoNew; round++) {
+    for (let round = 0; round < maxBottomRounds && bottomNoNewCount < maxBottomNoNew; round++) {
       const countBefore = allReplies.length;
       await page.evaluate(() => {
         const h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
@@ -1143,6 +1252,12 @@ export async function scrapeRepliesByTweetId(
       } else {
         bottomNoNewCount = 0;
       }
+      if (round % 4 === 0) {
+        updateProgress({
+          repliesFound: allReplies.length,
+          message: `正在抓取评论... 第2阶段 ${round + 1}/${maxBottomRounds} 轮`,
+        });
+      }
     }
 
     updateProgress({ stage: 'complete', message: `采集完成！共获取 ${allReplies.length} 条评论` });
@@ -1157,10 +1272,11 @@ export async function scrapeRepliesByTweetId(
   }
 }
 
-// 关闭浏览器
+// 鍏抽棴娴忚鍣?
 export async function closeBrowser(): Promise<void> {
   if (browserInstance) {
     await browserInstance.close().catch(() => {});
     browserInstance = null;
   }
 }
+
