@@ -97,6 +97,13 @@ function isBrowserLaunchFailure(error: unknown): boolean {
   );
 }
 
+function toBrowserLaunchHint(error: unknown): string {
+  const message = normalizeErrorMessage(error);
+  return `浏览器启动失败（当前运行环境缺少 Chromium 系统依赖，如 libnss3）。` +
+    `请改用 Docker 镜像部署（安装 libnss3 等依赖），或在设置中配置 Apify Token 作为后备。` +
+    `原始错误: ${message}`;
+}
+
 function toApifySort(sortMode: ReplySortMode): "Latest" | "Top" {
   return sortMode === "top" ? "Top" : "Latest";
 }
@@ -1167,7 +1174,13 @@ ${commentTexts}
                 commentsCount: 0,
               };
             }
-            return { success: false, method: 'puppeteer', error: result.error || '采集失败', commentsCount: 0 };
+            const finalError = result.error || '采集失败';
+            return {
+              success: false,
+              method: 'puppeteer',
+              error: isBrowserLaunchFailure(finalError) ? toBrowserLaunchHint(finalError) : finalError,
+              commentsCount: 0,
+            };
           }
           return {
             success: true,
@@ -1192,9 +1205,10 @@ ${commentTexts}
               commentsCount: 0,
             };
           }
+          const finalError = String(error?.message || error);
           setScrapeProgress(progressKey, {
             stage: 'error',
-            message: String(error?.message || error),
+            message: finalError,
             tweetsFound: 0,
             repliesFound: 0,
             currentTweet: 0,
@@ -1202,7 +1216,11 @@ ${commentTexts}
             currentAccount: 0,
             totalAccounts: 1,
           });
-          return { success: false, error: String(error?.message || error), commentsCount: 0 };
+          return {
+            success: false,
+            error: isBrowserLaunchFailure(finalError) ? toBrowserLaunchHint(finalError) : finalError,
+            commentsCount: 0,
+          };
         }
       }),
 
@@ -1323,18 +1341,20 @@ ${commentTexts}
             if (input.preferredMethod === 'auto' && apifyToken) {
               console.log(`Puppeteer 采集失败 (${playwrightError})，尝试使用 Apify...`);
             } else if (!result.success) {
+              const finalError = result.error || 'Puppeteer 采集失败';
               return {
                 success: false,
                 method: 'puppeteer',
-                error: result.error || 'Puppeteer 采集失败',
+                error: isBrowserLaunchFailure(finalError) ? toBrowserLaunchHint(finalError) : finalError,
                 commentsCount: 0,
               };
             }
           } catch (err) {
-            playwrightError = String(err);
+            const errorMessage = normalizeErrorMessage(err);
+            playwrightError = errorMessage;
             setScrapeProgress(input.username, {
               stage: "error",
-              message: `采集失败: ${String(err)}`,
+              message: `采集失败: ${errorMessage}`,
               tweetsFound: 0,
               repliesFound: 0,
               currentTweet: 0,
@@ -1346,7 +1366,7 @@ ${commentTexts}
               return {
                 success: false,
                 method: 'puppeteer',
-                error: String(err),
+                error: isBrowserLaunchFailure(errorMessage) ? toBrowserLaunchHint(errorMessage) : errorMessage,
                 commentsCount: 0,
               };
             }
@@ -1356,6 +1376,13 @@ ${commentTexts}
         // Try Apify if preferred or as fallback
         if (input.preferredMethod === 'apify' || input.preferredMethod === 'auto') {
           if (!apifyToken) {
+            if (playwrightError && isBrowserLaunchFailure(playwrightError)) {
+              return {
+                success: false,
+                error: toBrowserLaunchHint(playwrightError),
+                commentsCount: 0,
+              };
+            }
             return {
               success: false,
               error: '请配置 X Cookie 或 Apify API Token',

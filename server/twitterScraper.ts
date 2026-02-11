@@ -3,6 +3,10 @@ import chromium from '@sparticuz/chromium';
 import { getConfig } from './db';
 import type { Browser, Page, BrowserContext as PuppeteerBrowserContext, ElementHandle } from 'puppeteer-core';
 import fs from 'node:fs';
+import path from 'node:path';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 async function elGetAttribute(handle: ElementHandle<Element> | null, name: string): Promise<string | null> {
   if (!handle) return null;
@@ -386,6 +390,60 @@ function findLocalChromePath(): string | undefined {
   return undefined;
 }
 
+let sparticuzRuntimeSetupPromise: Promise<void> | null = null;
+
+async function ensureSparticuzRuntimeLibraries(): Promise<void> {
+  if (process.platform !== 'linux') return;
+  if (process.env.SPARTICUZ_SKIP_RUNTIME_SETUP === '1') return;
+  if (sparticuzRuntimeSetupPromise) return sparticuzRuntimeSetupPromise;
+
+  sparticuzRuntimeSetupPromise = (async () => {
+    try {
+      const packageRoot = path.dirname(require.resolve('@sparticuz/chromium/package.json'));
+      const binDir = path.join(packageRoot, 'bin');
+
+      // These archives contain shared libraries required by chromium in slim/serverless environments.
+      const archives = ['al2023.tar.br', 'al2.tar.br']
+        .map((name) => path.join(binDir, name))
+        .filter((archivePath) => fs.existsSync(archivePath));
+
+      if (archives.length === 0) return;
+
+      const [{ default: LambdaFS }, helper] = await Promise.all([
+        import('@sparticuz/chromium/build/lambdafs.js'),
+        import('@sparticuz/chromium/build/helper.js'),
+      ]);
+
+      for (const archivePath of archives) {
+        try {
+          await LambdaFS.inflate(archivePath);
+        } catch (error) {
+          console.warn(`[Scraper] Failed to extract runtime archive ${archivePath}:`, error);
+        }
+      }
+
+      const libDirs = ['/tmp/al2023/lib', '/tmp/al2/lib']
+        .filter((libDir) => fs.existsSync(libDir));
+      if (libDirs.length === 0) return;
+
+      const setupLambdaEnvironment = (helper as any)?.setupLambdaEnvironment as
+        | ((baseLibPath: string) => void)
+        | undefined;
+
+      if (setupLambdaEnvironment) {
+        for (const libDir of libDirs) setupLambdaEnvironment(libDir);
+      } else {
+        const current = process.env.LD_LIBRARY_PATH?.split(':').filter(Boolean) ?? [];
+        process.env.LD_LIBRARY_PATH = Array.from(new Set(libDirs.concat(current))).join(':');
+      }
+    } catch (error) {
+      console.warn('[Scraper] Sparticuz runtime library setup failed:', error);
+    }
+  })();
+
+  return sparticuzRuntimeSetupPromise;
+}
+
 /** Launch browser using @sparticuz/chromium (works in serverless/slim containers). */
 async function getBrowser(): Promise<Browser> {
   if (!browserInstance || !browserInstance.connected) {
@@ -395,6 +453,7 @@ async function getBrowser(): Promise<Browser> {
     const launchCandidates: Array<{ label: string; opts: Parameters<typeof puppeteer.launch>[0] }> = [];
 
     if (useSparticuz) {
+      await ensureSparticuzRuntimeLibraries();
       launchCandidates.push({
         label: '@sparticuz/chromium',
         opts: {
