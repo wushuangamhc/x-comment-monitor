@@ -55,7 +55,8 @@ export function AnalyticsPanel({ stats }: AnalyticsPanelProps) {
   }));
 
   // Fetch opinion clusters
-  const { data: opinionData } = trpc.analysis.generateOpinionClusters.useQuery({});
+  const clustersMutation = trpc.analysis.generateClusters.useMutation();
+  const opinionData = clustersMutation.data;
 
   return (
     <div className="p-4 bg-card/30">

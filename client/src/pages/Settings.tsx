@@ -21,7 +21,8 @@ export default function Settings() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [apifyToken, setApifyToken] = useState("");
   const [apifyTokenSaved, setApifyTokenSaved] = useState(false);
-  
+  const [proxyUrl, setProxyUrl] = useState("");
+
   // 多账号 Cookie 管理
   const [xCookiesList, setXCookiesList] = useState<string[]>([""]);
   const [xCookiesSaved, setXCookiesSaved] = useState(false);
@@ -39,6 +40,11 @@ export default function Settings() {
 
   const { data: existingXCookiesList } = trpc.config.get.useQuery(
     { key: "X_COOKIES_LIST" },
+    { enabled: isAuthenticated }
+  );
+
+  const { data: existingProxyUrl } = trpc.config.get.useQuery(
+    { key: "PLAYWRIGHT_PROXY" },
     { enabled: isAuthenticated }
   );
 
@@ -67,12 +73,23 @@ export default function Settings() {
     }
   }, [existingXCookiesList]);
 
+  useEffect(() => {
+    if (existingProxyUrl !== undefined) setProxyUrl(existingProxyUrl || "");
+  }, [existingProxyUrl]);
+
   // Config mutations
   const setConfigMutation = trpc.config.set.useMutation({
     onSuccess: () => {
       toast.success("配置已保存");
     },
-    onError: (err) => toast.error(`保存失败: ${err.message}`),
+    onError: (err) => {
+      const msg = err.message || "";
+      if (msg.includes("login") || msg.includes("10001") || msg.includes("UNAUTHORIZED")) {
+        toast.error("保存失败：请先登录后再保存配置");
+      } else {
+        toast.error(`保存失败: ${msg}`);
+      }
+    },
   });
 
   // Delete config mutation
@@ -264,6 +281,40 @@ export default function Settings() {
                   支持配置多个 X 账号 Cookie，系统会自动轮换使用以降低单账号被封风险。
                 </p>
               </div>
+
+              {/* 采集代理（可选） */}
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <Globe className="w-5 h-5" />
+                    采集代理（可选）
+                  </CardTitle>
+                  <CardDescription>
+                    访问 X 需代理时填写，例如 <code className="text-xs bg-muted px-1 rounded">http://127.0.0.1:7897</code>。留空则使用环境变量 HTTPS_PROXY 或直连。保存后下次采集会自动使用新代理。
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  <div className="flex gap-2">
+                    <Input
+                      placeholder="http://127.0.0.1:7897"
+                      value={proxyUrl}
+                      onChange={(e) => setProxyUrl(e.target.value)}
+                      className="font-mono"
+                    />
+                    <Button
+                      onClick={() => setConfigMutation.mutate({ key: "PLAYWRIGHT_PROXY", value: proxyUrl.trim() })}
+                      disabled={setConfigMutation.isPending}
+                    >
+                      {setConfigMutation.isPending ? (
+                        <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                      ) : (
+                        <Save className="w-4 h-4 mr-2" />
+                      )}
+                      保存
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
 
               {/* X Cookies Config - Multiple Accounts */}
               <Card className="border-green-500/50">

@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { trpc } from "@/lib/trpc";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -64,8 +64,35 @@ export function MonitorDashboard() {
   // Monitor mode and targets
   const [monitorMode, setMonitorMode] = useState<MonitorMode>('username');
   const [usernameInput, setUsernameInput] = useState("");
-  const [monitoredAccounts, setMonitoredAccounts] = useState<MonitoredAccount[]>([]);
-  const [activeAccount, setActiveAccount] = useState<string | null>(null);
+  // const [monitoredAccounts, setMonitoredAccounts] = useState<MonitoredAccount[]>([]); // Removed local state
+  const { data: monitoredAccounts = [], refetch: refetchMonitors } = trpc.monitors.list.useQuery();
+  const activeAccountState = useState<string | null>(null);
+  const [activeAccount, setActiveAccount] = activeAccountState;
+
+  // Sync active account with fetched monitors
+  useEffect(() => {
+    if (!activeAccount && monitoredAccounts.length > 0) {
+      setActiveAccount(monitoredAccounts[0].targetId);
+    }
+  }, [monitoredAccounts, activeAccount]);
+
+  const addMonitorMutation = trpc.monitors.add.useMutation({
+    onSuccess: () => {
+      toast.success("添加成功");
+      refetchMonitors();
+      setUsernameInput("");
+    },
+    onError: (error) => toast.error(`添加失败: ${error.message}`)
+  });
+
+  const deleteMonitorMutation = trpc.monitors.delete.useMutation({
+    onSuccess: () => {
+      toast.success("移除成功");
+      refetchMonitors();
+    },
+    onError: (error) => toast.error(`移除失败: ${error.message}`)
+  });
+
   const [tweetId, setTweetId] = useState<string>("");
   
   // Filter states
@@ -76,10 +103,13 @@ export function MonitorDashboard() {
   const [sortBy, setSortBy] = useState<SortOption>('time_desc');
   const [showFilters, setShowFilters] = useState(true);
   const [showAnalytics, setShowAnalytics] = useState(true);
+  const [showUnanalyzedOnly, setShowUnanalyzedOnly] = useState(false);
   const [refreshInterval, setRefreshInterval] = useState(30000);
   const [newCommentsCount, setNewCommentsCount] = useState(0);
   const [lastCommentCount, setLastCommentCount] = useState(0);
   const [isFetching, setIsFetching] = useState(false);
+  const [fetchingTweetId, setFetchingTweetId] = useState<string | null>(null); // Tweet ID 模式下正在采集的 ID，用于进度轮询
+  const [maxTweetsToFetch, setMaxTweetsToFetch] = useState(30); // 单次采集推文数，可 10/30/50/100，长期跑可多次点采集
   const [fetchProgress, setFetchProgress] = useState<{
     stage: string;
     message: string;
@@ -87,7 +117,33 @@ export function MonitorDashboard() {
     repliesFound: number;
     currentTweet: number;
     totalTweets: number;
+    currentAccount?: number;
+    totalAccounts?: number;
   } | null>(null);
+  const prevCommentCountRef = useRef(0);
+
+  const progressQueryKey = monitorMode === 'username' ? (activeAccount || '') : (fetchingTweetId ? `tweet:${fetchingTweetId}` : '');
+  const { data: scrapeProgressData } = trpc.twitter.getScrapeProgress.useQuery(
+    { username: progressQueryKey },
+    {
+      enabled: (isFetching && !!activeAccount) || !!fetchingTweetId,
+      refetchInterval: 1000,
+    }
+  );
+
+  useEffect(() => {
+    const p = scrapeProgressData?.progress as any;
+    if (p) setFetchProgress(p);
+    if (p?.stage === "error") {
+      toast.error(p?.message || "采集失败");
+      setIsFetching(false);
+      setFetchingTweetId(null);
+    }
+    if (p?.stage === "complete") {
+      setIsFetching(false);
+      setFetchingTweetId(null);
+    }
+  }, [scrapeProgressData, isFetching, fetchingTweetId]);
   
   // Custom time range states
   const [customStartDate, setCustomStartDate] = useState<Date | undefined>(undefined);
@@ -127,39 +183,15 @@ export function MonitorDashboard() {
     return undefined;
   }, [timeRange, customEndDate, customEndTime]);
 
-  // Fetch comments
-  const { data: comments, isLoading, refetch, dataUpdatedAt } = trpc.comments.list.useQuery({
-    tweetId: tweetId || undefined,
-    sentiments: selectedSentiments.length > 0 ? selectedSentiments : undefined,
-    minValueScore: valueRange[0],
-    maxValueScore: valueRange[1],
-    startTime: timeFilter,
-    sortBy,
-    limit: 100,
-  }, {
-    refetchInterval: refreshInterval,
-  });
-
-  // Fetch stats
-  const { data: stats } = trpc.comments.stats.useQuery({
-    tweetId: tweetId || undefined,
-  }, {
-    refetchInterval: refreshInterval,
-  });
-
-  // Fetch top commenters
-  const { data: topCommenters } = trpc.comments.topCommenters.useQuery({
-    tweetId: tweetId || undefined,
-    limit: 10,
-  });
-
-  // Smart fetch mutation - 优先使用 Playwright，Apify 作为备选
+  const utils = trpc.useUtils();
+  // Smart fetch mutation - 定义在 list 查询前，便于用 isPending 驱动采集期间短间隔轮询
   const smartFetch = trpc.twitter.smartFetch.useMutation({
     onSuccess: (data) => {
       if (data.success) {
         const method = data.method === 'playwright' ? 'Playwright 自爬' : 'Apify API';
         toast.success(data.message || `使用 ${method} 成功获取 ${data.commentsCount} 条评论`);
-        refetch();
+        void utils.comments.list.invalidate();
+        void utils.comments.stats.invalidate();
       } else {
         toast.error(data.error || "获取失败");
       }
@@ -171,6 +203,58 @@ export function MonitorDashboard() {
       setIsFetching(false);
       setFetchProgress(null);
     },
+  });
+
+  const scrapeByTweetId = trpc.twitter.scrapeByTweetId.useMutation({
+    onSuccess: (data) => {
+      if (data.success) {
+        toast.success(data.message || `已采集 ${data.commentsCount} 条评论，可查看与导出`);
+        void utils.comments.list.invalidate();
+        void utils.comments.stats.invalidate();
+      } else {
+        toast.error(data.error || "采集失败");
+      }
+      setFetchingTweetId(null);
+      setFetchProgress(null);
+    },
+    onError: (error) => {
+      toast.error(`采集失败: ${error.message}`);
+      setFetchingTweetId(null);
+      setFetchProgress(null);
+    },
+  });
+
+  const scraping = isFetching || smartFetch.isPending || scrapeByTweetId.isPending; // 采集中：短间隔轮询
+
+  // Fetch comments（采集中 250ms 轮询，每采到一条就刷新列表，新评论出现在顶部）
+  const { data: comments, isLoading, refetch, dataUpdatedAt } = trpc.comments.list.useQuery({
+    tweetId: tweetId || undefined,
+    rootTweetAuthor: monitorMode === 'username' && activeAccount ? activeAccount : undefined,
+    sentiments: selectedSentiments.length > 0 ? selectedSentiments : undefined,
+    minValueScore: valueRange[0],
+    maxValueScore: valueRange[1],
+    startTime: timeFilter,
+    sortBy,
+    limit: 100,
+    analyzed: showUnanalyzedOnly ? false : undefined,
+  }, {
+    refetchInterval: scraping ? 250 : refreshInterval,
+    refetchIntervalInBackground: scraping,
+  });
+
+  // Fetch stats（与 list 同口径，采集中与列表同频刷新）
+  const { data: stats } = trpc.comments.stats.useQuery({
+    tweetId: tweetId || undefined,
+    rootTweetAuthor: monitorMode === 'username' && activeAccount ? activeAccount : undefined,
+  }, {
+    refetchInterval: scraping ? 250 : refreshInterval,
+    refetchIntervalInBackground: scraping,
+  });
+
+  // Fetch top commenters
+  const { data: topCommenters } = trpc.comments.topCommenters.useQuery({
+    tweetId: tweetId || undefined,
+    limit: 10,
   });
 
   const toggleSentiment = (sentiment: Sentiment) => {
@@ -193,6 +277,16 @@ export function MonitorDashboard() {
     }
   }, [comments?.length, lastCommentCount]);
 
+  // 采集中每刷新出更多评论时，将列表滚动到顶部，方便看到刚采集到的新评论（新评论在顶部）
+  useEffect(() => {
+    const count = comments?.length ?? 0;
+    if (scraping && count > prevCommentCountRef.current && prevCommentCountRef.current >= 0) {
+      const viewport = document.querySelector('[data-slot="scroll-area-viewport"]');
+      if (viewport) viewport.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+    prevCommentCountRef.current = count;
+  }, [scraping, comments?.length]);
+
   // Add account to monitor
   const addAccount = () => {
     const username = usernameInput.trim().replace('@', '');
@@ -200,23 +294,25 @@ export function MonitorDashboard() {
       toast.error("请输入用户名");
       return;
     }
-    if (monitoredAccounts.some(a => a.username.toLowerCase() === username.toLowerCase())) {
+    if (monitoredAccounts.some(a => a.targetId.toLowerCase() === username.toLowerCase())) {
       toast.error("该账号已在监控列表中");
       return;
     }
-    setMonitoredAccounts(prev => [...prev, { username, isActive: true }]);
-    setActiveAccount(username);
-    setUsernameInput("");
-    toast.success(`已添加 @${username} 到监控列表`);
+    
+    addMonitorMutation.mutate({
+      type: "account",
+      targetId: username,
+      targetHandle: username,
+      targetName: username
+    });
   };
 
   // Remove account from monitor
-  const removeAccount = (username: string) => {
-    setMonitoredAccounts(prev => prev.filter(a => a.username !== username));
+  const removeAccount = (id: number, username: string) => {
+    deleteMonitorMutation.mutate({ id });
     if (activeAccount === username) {
-      setActiveAccount(monitoredAccounts.find(a => a.username !== username)?.username || null);
+      setActiveAccount(null);
     }
-    toast.success(`已移除 @${username}`);
   };
 
   // Start fetching comments for account
@@ -229,30 +325,37 @@ export function MonitorDashboard() {
       tweetsFound: 0,
       repliesFound: 0,
       currentTweet: 0,
-      totalTweets: 10,
+      totalTweets: maxTweetsToFetch,
     });
-    // 使用智能采集，优先 Playwright，备选 Apify
+    // 使用智能采集，优先 Playwright，备选 Apify；可多次运行拉取更多历史（单次最多 100 条推文）
     smartFetch.mutate({ 
       username, 
-      maxTweets: 10, 
-      maxRepliesPerTweet: 30,
-      preferredMethod: 'auto' 
+      maxTweets: maxTweetsToFetch, 
+      maxRepliesPerTweet: 0, // 0 = 不限制，每条推文评论最多 300 条
+      preferredMethod: 'playwright' 
     });
   };
 
-  // Export comments to Excel
+  // Export comments to Excel（调用 exportData 接口，无条数限制，与当前筛选条件一致）
   const handleExportExcel = async () => {
-    if (!comments || comments.length === 0) {
-      toast.error("没有可导出的评论数据");
-      return;
-    }
-
     try {
-      // 动态导入 xlsx
+      const list = await utils.comments.exportData.fetch({
+        tweetId: tweetId || undefined,
+        rootTweetAuthor: monitorMode === 'username' && activeAccount ? activeAccount : undefined,
+        startTime: timeFilter,
+        endTime: timeFilterEnd,
+        sentiments: selectedSentiments.length > 0 ? selectedSentiments : undefined,
+        minValueScore: valueRange[0],
+        maxValueScore: valueRange[1],
+        analyzed: showUnanalyzedOnly ? false : undefined,
+      });
+      if (!list || list.length === 0) {
+        toast.error("没有可导出的评论数据");
+        return;
+      }
+
       const XLSX = await import('xlsx');
-      
-      // 准备数据
-      const exportData = comments.map((comment: any) => ({
+      const exportData = list.map((comment: any) => ({
         '评论 ID': comment.replyId,
         '推文 ID': comment.tweetId,
         '作者名称': comment.authorName,
@@ -266,35 +369,16 @@ export function MonitorDashboard() {
         '分析时间': comment.analyzedAt ? new Date(comment.analyzedAt).toLocaleString('zh-CN') : '',
       }));
 
-      // 创建工作表
       const ws = XLSX.utils.json_to_sheet(exportData);
-      
-      // 设置列宽
       ws['!cols'] = [
-        { wch: 20 }, // 评论 ID
-        { wch: 20 }, // 推文 ID
-        { wch: 15 }, // 作者名称
-        { wch: 15 }, // 作者用户名
-        { wch: 50 }, // 评论内容
-        { wch: 20 }, // 发布时间
-        { wch: 8 },  // 点赞数
-        { wch: 10 }, // 情绪类型
-        { wch: 10 }, // 价值评分
-        { wch: 30 }, // AI 摘要
-        { wch: 20 }, // 分析时间
+        { wch: 20 }, { wch: 20 }, { wch: 15 }, { wch: 15 }, { wch: 50 },
+        { wch: 20 }, { wch: 8 }, { wch: 10 }, { wch: 10 }, { wch: 30 }, { wch: 20 },
       ];
-
-      // 创建工作簿
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, '评论数据');
-
-      // 生成文件名
       const timestamp = new Date().toISOString().slice(0, 10);
       const filename = `X评论导出_${activeAccount || 'all'}_${timestamp}.xlsx`;
-
-      // 下载文件
       XLSX.writeFile(wb, filename);
-      
       toast.success(`已导出 ${exportData.length} 条评论`);
     } catch (error) {
       console.error('Export error:', error);
@@ -334,6 +418,22 @@ export function MonitorDashboard() {
                 </Button>
               </div>
 
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs text-muted-foreground">单次采集</span>
+                <Select value={String(maxTweetsToFetch)} onValueChange={(v) => setMaxTweetsToFetch(Number(v))}>
+                  <SelectTrigger className="h-8 w-[88px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="10">10 条推文</SelectItem>
+                    <SelectItem value="30">30 条推文</SelectItem>
+                    <SelectItem value="50">50 条推文</SelectItem>
+                    <SelectItem value="100">100 条推文</SelectItem>
+                  </SelectContent>
+                </Select>
+                <span className="text-xs text-muted-foreground">可多次运行拉取更多历史</span>
+              </div>
+
               {/* Monitored Accounts List */}
               {monitoredAccounts.length > 0 && (
                 <div className="space-y-2">
@@ -341,17 +441,17 @@ export function MonitorDashboard() {
                   <div className="space-y-1">
                     {monitoredAccounts.map((account) => (
                       <div 
-                        key={account.username}
+                        key={account.id}
                         className={`flex items-center justify-between p-2 rounded-md cursor-pointer transition-colors ${
-                          activeAccount === account.username 
+                          activeAccount === account.targetId 
                             ? 'bg-primary/10 border border-primary/30' 
                             : 'bg-muted/50 hover:bg-muted'
                         }`}
-                        onClick={() => setActiveAccount(account.username)}
+                        onClick={() => setActiveAccount(account.targetId)}
                       >
                         <div className="flex items-center gap-2">
                           <User className="w-4 h-4 text-muted-foreground" />
-                          <span className="text-sm font-medium">@{account.username}</span>
+                          <span className="text-sm font-medium">@{account.targetId}</span>
                         </div>
                         <div className="flex items-center gap-1">
                           <Button
@@ -360,11 +460,11 @@ export function MonitorDashboard() {
                             className="h-7 w-7 p-0"
                             onClick={(e) => {
                               e.stopPropagation();
-                              startFetching(account.username);
+                              startFetching(account.targetId);
                             }}
                             disabled={isFetching}
                           >
-                            <Play className={`w-3 h-3 ${isFetching && activeAccount === account.username ? 'animate-pulse' : ''}`} />
+                            <Play className={`w-3 h-3 ${isFetching && activeAccount === account.targetId ? 'animate-pulse' : ''}`} />
                           </Button>
                           <Button
                             variant="ghost"
@@ -372,7 +472,7 @@ export function MonitorDashboard() {
                             className="h-7 w-7 p-0 text-destructive hover:text-destructive"
                             onClick={(e) => {
                               e.stopPropagation();
-                              removeAccount(account.username);
+                              removeAccount(account.id, account.targetId);
                             }}
                           >
                             <Trash2 className="w-3 h-3" />
@@ -403,8 +503,53 @@ export function MonitorDashboard() {
               <p className="text-xs text-muted-foreground">
                 Tweet ID 是推文链接中的数字，例如: x.com/user/status/<strong>1234567890</strong>
               </p>
+              <Button
+                size="sm"
+                className="w-full"
+                onClick={() => {
+                  const id = tweetId.trim();
+                  if (!id) {
+                    toast.error("请输入 Tweet ID");
+                    return;
+                  }
+                  setFetchingTweetId(id);
+                  setFetchProgress({ stage: 'init', message: '正在初始化...', tweetsFound: 0, repliesFound: 0, currentTweet: 1, totalTweets: 1 });
+                  scrapeByTweetId.mutate({ tweetId: id });
+                }}
+                disabled={scrapeByTweetId.isPending || !tweetId.trim()}
+              >
+                {scrapeByTweetId.isPending && fetchingTweetId === tweetId.trim() ? (
+                  <>采集中...</>
+                ) : (
+                  <>采集该推文下全部评论</>
+                )}
+              </Button>
             </TabsContent>
           </Tabs>
+
+          <Separator />
+
+          {/* Status Filter */}
+          <div className="space-y-3">
+            <label className="text-sm font-medium flex items-center gap-2">
+              <Filter className="w-4 h-4" />
+              状态筛选
+            </label>
+            <p className="text-xs text-muted-foreground">默认显示全部评论</p>
+            <div className="flex items-center space-x-2">
+              <Checkbox 
+                id="unanalyzed" 
+                checked={showUnanalyzedOnly}
+                onCheckedChange={(checked) => setShowUnanalyzedOnly(!!checked)}
+              />
+              <label
+                htmlFor="unanalyzed"
+                className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
+              >
+                只显示未分析评论
+              </label>
+            </div>
+          </div>
 
           <Separator />
 
@@ -630,15 +775,17 @@ export function MonitorDashboard() {
               </Badge>
             )}
 
-            {isFetching && (
+            {(isFetching || (scrapeByTweetId.isPending && !!fetchingTweetId)) && (
               <div className="flex items-center gap-2">
                 <Badge variant="secondary" className="animate-pulse">
                   <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
                   {fetchProgress?.message || '正在获取...'}
                 </Badge>
-                {fetchProgress && fetchProgress.tweetsFound > 0 && (
+                {fetchProgress && (fetchProgress.tweetsFound > 0 || fetchProgress.repliesFound > 0) && (
                   <span className="text-xs text-muted-foreground">
-                    推文: {fetchProgress.currentTweet}/{fetchProgress.totalTweets} | 评论: {fetchProgress.repliesFound}
+                    {fetchProgress.totalTweets > 1
+                      ? `推文: ${fetchProgress.currentTweet}/${fetchProgress.totalTweets} | 评论: ${fetchProgress.repliesFound}`
+                      : `评论: ${fetchProgress.repliesFound}`}
                   </span>
                 )}
               </div>
@@ -681,7 +828,7 @@ export function MonitorDashboard() {
               variant="outline"
               size="sm"
               onClick={handleExportExcel}
-              disabled={!comments || comments.length === 0}
+              disabled={!(stats?.totalComments && stats.totalComments > 0)}
             >
               <Download className="w-4 h-4 mr-1" />
               导出

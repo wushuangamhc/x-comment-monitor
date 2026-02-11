@@ -1,6 +1,6 @@
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Heart, MessageSquare, Clock } from "lucide-react";
+import { Heart, MessageSquare, Clock, ExternalLink } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { zhCN } from "date-fns/locale";
 
@@ -12,6 +12,8 @@ interface CommentCardProps {
     text: string;
     createdAt: Date | string;
     likeCount: number;
+    replyTo?: string | null;
+    replyToText?: string | null;
     sentiment?: string | null;
     valueScore?: string | null;
     summary?: string | null;
@@ -94,6 +96,20 @@ export function CommentCard({ comment }: CommentCardProps) {
             <Heart className="w-3 h-3" />
             {comment.likeCount}
           </div>
+          {comment.replyTo && (
+            <a 
+              href={`https://x.com/i/status/${comment.replyTo}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1 hover:text-primary transition-colors ml-auto text-xs text-muted-foreground max-w-[400px]"
+              title={comment.replyToText || "查看原推文"}
+            >
+              <ExternalLink className="w-3 h-3 flex-shrink-0" />
+              <span className="truncate">
+                回复: {comment.replyToText ? (comment.replyToText.length > 50 ? comment.replyToText.slice(0, 50) + '...' : comment.replyToText) : '推文'}
+              </span>
+            </a>
+          )}
         </div>
       </CardContent>
     </Card>

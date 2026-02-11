@@ -25,6 +25,7 @@ import {
 } from "./db";
 import { 
   scrapeUserComments as playwrightScrapeUserComments,
+  scrapeRepliesByTweetId,
   getScrapeConfig,
   setScrapeConfig,
   applyScrapePreset,
@@ -33,9 +34,11 @@ import {
   addAccountCookie,
   removeAccountCookie,
   getAccountCount,
+  closeBrowser,
   type ScrapeConfig,
   type ScrapeProgress,
 } from "./twitterScraper";
+import { clearScrapeProgress, getScrapeProgress, setScrapeProgress } from "./scrapeProgressStore";
 
 // Sentiment types
 const sentimentEnum = z.enum(["positive", "neutral", "negative", "anger", "sarcasm"]);
@@ -44,6 +47,7 @@ const sentimentEnum = z.enum(["positive", "neutral", "negative", "anger", "sarca
 const commentFilterSchema = z.object({
   tweetId: z.string().optional(),
   authorHandles: z.array(z.string()).optional(),
+  rootTweetAuthor: z.string().optional(),
   startTime: z.date().optional(),
   endTime: z.date().optional(),
   sentiments: z.array(sentimentEnum).optional(),
@@ -52,6 +56,7 @@ const commentFilterSchema = z.object({
   sortBy: z.enum(['time_desc', 'time_asc', 'value_desc', 'likes_desc']).optional(),
   limit: z.number().min(1).max(100).optional(),
   offset: z.number().min(0).optional(),
+  analyzed: z.boolean().optional(),
 });
 
 // Raw comment schema for insertion
@@ -94,22 +99,29 @@ export const appRouter = router({
         return await getCommentsWithAnalysis(input);
       }),
 
-    // 导出评论数据
+    // 导出评论数据（无条数限制，与当前列表筛选条件一致）
     exportData: publicProcedure
       .input(z.object({
         tweetId: z.string().optional(),
+        rootTweetAuthor: z.string().optional(),
         startTime: z.date().optional(),
         endTime: z.date().optional(),
+        sentiments: z.array(sentimentEnum).optional(),
+        minValueScore: z.number().min(0).max(1).optional(),
+        maxValueScore: z.number().min(0).max(1).optional(),
+        analyzed: z.boolean().optional(),
       }))
       .query(async ({ input }) => {
-        const comments = await getAllCommentsForExport(input);
-        return comments;
+        return await getAllCommentsForExport(input);
       }),
 
     stats: publicProcedure
-      .input(z.object({ tweetId: z.string().optional() }))
+      .input(z.object({
+        tweetId: z.string().optional(),
+        rootTweetAuthor: z.string().optional(),
+      }))
       .query(async ({ input }) => {
-        const stats = await getCommentStats(input.tweetId);
+        const stats = await getCommentStats(input.tweetId, input.rootTweetAuthor);
         const sentimentCounts: Record<string, number> = {
           positive: 0, neutral: 0, negative: 0, anger: 0, sarcasm: 0,
         };
@@ -119,7 +131,7 @@ export const appRouter = router({
         stats.forEach(item => {
           if (item.sentiment) sentimentCounts[item.sentiment]++;
           if (item.valueScore) {
-            const bucket = Math.min(Math.floor(parseFloat(item.valueScore) * 10), 9);
+            const bucket = Math.min(Math.floor(parseFloat(String(item.valueScore)) * 10), 9);
             valueDistribution[bucket]++;
           }
           if (item.createdAt && item.sentiment) {
@@ -198,8 +210,8 @@ export const appRouter = router({
                 type: "object",
                 properties: {
                   sentiment: { type: "string", enum: ["positive", "neutral", "negative", "anger", "sarcasm"], description: "情绪类型" },
-                  valueScore: { type: "number", description: "评论价值评分 0-1" },
-                  valueType: { type: "array", items: { type: "string" }, description: "价值类型数组" },
+                  valueScore: { type: "number", description: "价值评分 0-1" },
+                  valueType: { type: "array", items: { type: "string" }, description: "价值类型" },
                   summary: { type: "string", description: "一句话摘要" },
                 },
                 required: ["sentiment", "valueScore", "valueType", "summary"],
@@ -210,27 +222,26 @@ export const appRouter = router({
         });
 
         const content = response.choices[0]?.message?.content as string | undefined;
-        if (!content) throw new Error("AI analysis failed: no response");
+        if (content) {
+          const analysis = JSON.parse(content);
+          await insertAnalyzedComment({
+            replyId: input.replyId,
+            sentiment: analysis.sentiment,
+            valueScore: String(analysis.valueScore),
+            valueType: analysis.valueType,
+            summary: analysis.summary,
+          });
+          return { success: true, analysis };
+        }
 
-        const analysis = JSON.parse(content);
-        analysis.valueScore = Math.max(0, Math.min(1, analysis.valueScore));
-        
-        await insertAnalyzedComment({
-          replyId: input.replyId,
-          sentiment: analysis.sentiment,
-          valueScore: analysis.valueScore.toFixed(2),
-          valueType: analysis.valueType,
-          summary: analysis.summary,
-        });
-
-        return analysis;
+        return { success: false, error: "No analysis result" };
       }),
 
     analyzeUnanalyzed: protectedProcedure
-      .input(z.object({ limit: z.number().min(1).max(20).default(5) }))
+      .input(z.object({ limit: z.number().min(1).max(50).default(10) }))
       .mutation(async ({ input }) => {
         const unanalyzed = await getUnanalyzedComments(input.limit);
-        const results = [];
+        let analyzed = 0;
 
         for (const comment of unanalyzed) {
           try {
@@ -240,16 +251,16 @@ export const appRouter = router({
 "${comment.text}"
 
 请分析并返回以下字段：
-1. sentiment: 情绪类型，必须是以下之一：positive、neutral、negative、anger、sarcasm
-2. valueScore: 评论价值评分（0-1）
-3. valueType: 价值类型数组
+1. sentiment: 情绪类型，必须是以下之一：positive（支持、认可）、neutral（陈述、围观）、negative（不满、批评）、anger（愤怒、攻击）、sarcasm（讽刺、阴阳）
+2. valueScore: 评论价值评分（0-1），参考因素：是否有信息增量、是否代表一类人观点、是否可能影响舆论走向、是否容易被引用或传播
+3. valueType: 价值类型数组，可能包含：informative（有信息量）、representative（代表性观点）、influential（有影响力）、viral（易传播）
 4. summary: 一句话摘要（中文，20字以内）
 
 只返回 JSON，不要其他内容。`;
 
             const response = await invokeLLM({
               messages: [
-                { role: "system", content: "你是一个专业的社交媒体舆情分析师。" },
+                { role: "system", content: "你是一个专业的社交媒体舆情分析师，擅长分析评论的情绪和价值。" },
                 { role: "user", content: prompt },
               ],
               response_format: {
@@ -260,10 +271,10 @@ export const appRouter = router({
                   schema: {
                     type: "object",
                     properties: {
-                      sentiment: { type: "string", enum: ["positive", "neutral", "negative", "anger", "sarcasm"] },
-                      valueScore: { type: "number" },
-                      valueType: { type: "array", items: { type: "string" } },
-                      summary: { type: "string" },
+                      sentiment: { type: "string", enum: ["positive", "neutral", "negative", "anger", "sarcasm"], description: "情绪类型" },
+                      valueScore: { type: "number", description: "价值评分 0-1" },
+                      valueType: { type: "array", items: { type: "string" }, description: "价值类型" },
+                      summary: { type: "string", description: "一句话摘要" },
                     },
                     required: ["sentiment", "valueScore", "valueType", "summary"],
                     additionalProperties: false,
@@ -275,58 +286,57 @@ export const appRouter = router({
             const content = response.choices[0]?.message?.content as string | undefined;
             if (content) {
               const analysis = JSON.parse(content);
-              analysis.valueScore = Math.max(0, Math.min(1, analysis.valueScore));
-              
               await insertAnalyzedComment({
                 replyId: comment.replyId,
                 sentiment: analysis.sentiment,
-                valueScore: analysis.valueScore.toFixed(2),
+                valueScore: String(analysis.valueScore),
                 valueType: analysis.valueType,
                 summary: analysis.summary,
               });
-
-              results.push({ replyId: comment.replyId, success: true, analysis });
+              analyzed++;
             }
           } catch (error) {
-            results.push({ replyId: comment.replyId, success: false, error: String(error) });
+            console.error(`Failed to analyze comment ${comment.replyId}:`, error);
           }
         }
 
-        return { analyzed: results.filter(r => r.success).length, results };
+        return { analyzed };
       }),
 
-    generateOpinionClusters: publicProcedure
-      .input(z.object({ tweetId: z.string().optional() }))
-      .query(async ({ input }) => {
+    // Generate opinion clusters
+    generateClusters: protectedProcedure
+      .input(z.object({
+        tweetId: z.string().optional(),
+        limit: z.number().min(5).max(100).default(50),
+      }))
+      .mutation(async ({ input }) => {
         const comments = await getCommentsWithAnalysis({
           tweetId: input.tweetId,
-          minValueScore: 0.4,
-          limit: 50,
+          limit: input.limit,
+          sortBy: 'value_desc',
         });
 
-        if (comments.length === 0) return { clusters: [] };
+        if (comments.length < 3) {
+          return { clusters: [] };
+        }
 
-        const commentTexts = comments
-          .filter(c => c.summary)
-          .map(c => `- ${c.summary} (情绪: ${c.sentiment}, 价值: ${c.valueScore})`)
-          .join('\n');
-
-        const prompt = `基于以下评论摘要，提取 3-5 个主要观点类别，每个类别给出：
-1. 观点名称（简短）
-2. 观点描述（一句话）
-3. 代表性评论索引（从0开始）
-4. 该观点的评论数量占比估计
+        try {
+          const commentTexts = comments.map((c, i) => `[${i}] @${c.authorHandle}: ${c.text}`).join('\n');
+          
+          const response = await invokeLLM({
+            messages: [
+              { role: "system", content: "你是一个专业的舆情分析师，擅长将评论归类为不同的观点群组。" },
+              { role: "user", content: `将以下评论归类为 3-5 个观点群组，每个群组需要：
+1. label: 群组标签（中文，5字以内）
+2. summary: 群组摘要（中文，30字以内）
+3. sentiment: 主要情绪（positive/neutral/negative/anger/sarcasm）
+4. count: 该群组的评论数量
+5. representativeIndex: 最具代表性的评论索引号
 
 评论列表：
 ${commentTexts}
 
-返回 JSON 格式。`;
-
-        try {
-          const response = await invokeLLM({
-            messages: [
-              { role: "system", content: "你是一个专业的舆情分析师，擅长从大量评论中提取关键观点。" },
-              { role: "user", content: prompt },
+返回 JSON 格式：{ "clusters": [...] }` },
             ],
             response_format: {
               type: "json_schema",
@@ -341,12 +351,13 @@ ${commentTexts}
                       items: {
                         type: "object",
                         properties: {
-                          name: { type: "string", description: "观点名称" },
-                          description: { type: "string", description: "观点描述" },
-                          representativeIndex: { type: "number", description: "代表性评论索引" },
-                          percentage: { type: "number", description: "占比估计" },
+                          label: { type: "string" },
+                          summary: { type: "string" },
+                          sentiment: { type: "string" },
+                          count: { type: "integer" },
+                          representativeIndex: { type: "integer" },
                         },
-                        required: ["name", "description", "representativeIndex", "percentage"],
+                        required: ["label", "summary", "sentiment", "count", "representativeIndex"],
                         additionalProperties: false,
                       },
                     },
@@ -424,6 +435,9 @@ ${commentTexts}
       }))
       .mutation(async ({ input }) => {
         await setConfig(input.key, input.value, input.description);
+        if (input.key === 'PLAYWRIGHT_PROXY') {
+          await closeBrowser();
+        }
         return { success: true };
       }),
 
@@ -490,6 +504,12 @@ ${commentTexts}
 
   // Twitter data collection router
   twitter: router({
+    getScrapeProgress: protectedProcedure
+      .input(z.object({ username: z.string() }))
+      .query(({ input }) => {
+        return { progress: getScrapeProgress(input.username) };
+      }),
+
     getUserProfile: protectedProcedure
       .input(z.object({ username: z.string() }))
       .query(async ({ input }) => {
@@ -580,14 +600,12 @@ ${commentTexts}
         maxCommentsPerTweet: z.number().min(1).max(200).default(50),
       }))
       .mutation(async ({ input }) => {
-        // Get Apify API token from config
         const apifyToken = await getConfig('APIFY_API_TOKEN');
         if (!apifyToken) {
           return { success: false, error: '请先在设置页面配置 Apify API Token', commentsCount: 0 };
         }
 
         try {
-          // Step 1: Get user's tweets using Apify
           const tweetsResponse = await fetch(
             `https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite/runs?token=${apifyToken}`,
             {
@@ -608,18 +626,15 @@ ${commentTexts}
 
           const tweetsRun = await tweetsResponse.json();
           const runId = tweetsRun.data?.id;
-          
           if (!runId) {
             return { success: false, error: '无法启动 Apify 任务', commentsCount: 0 };
           }
 
-          // Wait for the run to complete (poll status)
           let runStatus = 'RUNNING';
           let attempts = 0;
-          const maxAttempts = 60; // Max 5 minutes wait
-          
+          const maxAttempts = 60;
           while (runStatus === 'RUNNING' && attempts < maxAttempts) {
-            await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
+            await new Promise(resolve => setTimeout(resolve, 5000));
             const statusResponse = await fetch(
               `https://api.apify.com/v2/actor-runs/${runId}?token=${apifyToken}`
             );
@@ -632,7 +647,6 @@ ${commentTexts}
             return { success: false, error: `Apify 任务未完成: ${runStatus}`, commentsCount: 0 };
           }
 
-          // Get tweets from dataset
           const datasetId = tweetsRun.data?.defaultDatasetId;
           const tweetsDataResponse = await fetch(
             `https://api.apify.com/v2/datasets/${datasetId}/items?token=${apifyToken}`
@@ -643,13 +657,11 @@ ${commentTexts}
             return { success: false, error: '未找到该用户的推文', commentsCount: 0 };
           }
 
-          // Step 2: For each tweet, fetch replies using conversation_id
           let totalComments = 0;
           const tweetIds = tweets.slice(0, input.maxTweets).map((t: any) => t.id);
 
           for (const tweetId of tweetIds) {
             try {
-              // Fetch replies for this tweet
               const repliesResponse = await fetch(
                 `https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite/runs?token=${apifyToken}`,
                 {
@@ -669,7 +681,6 @@ ${commentTexts}
               const repliesRunId = repliesRun.data?.id;
               if (!repliesRunId) continue;
 
-              // Wait for replies run to complete
               let repliesStatus = 'RUNNING';
               let repliesAttempts = 0;
               while (repliesStatus === 'RUNNING' && repliesAttempts < 30) {
@@ -684,16 +695,14 @@ ${commentTexts}
 
               if (repliesStatus !== 'SUCCEEDED') continue;
 
-              // Get replies from dataset
               const repliesDatasetId = repliesRun.data?.defaultDatasetId;
               const repliesDataResponse = await fetch(
                 `https://api.apify.com/v2/datasets/${repliesDatasetId}/items?token=${apifyToken}`
               );
               const replies = await repliesDataResponse.json();
 
-              // Insert replies into database
               for (const reply of replies) {
-                if (reply.id === tweetId) continue; // Skip the original tweet
+                if (reply.id === tweetId) continue;
                 try {
                   await insertRawComment({
                     replyId: reply.id,
@@ -726,26 +735,50 @@ ${commentTexts}
     scrapeWithPlaywright: protectedProcedure
       .input(z.object({
         username: z.string(),
-        maxTweets: z.number().min(1).max(50).default(10),
-        maxRepliesPerTweet: z.number().min(1).max(100).default(30),
+        maxTweets: z.number().min(1).max(100).default(30),
+        maxRepliesPerTweet: z.number().min(0).max(300).default(0),
       }))
       .mutation(async ({ input }) => {
-        // Get X cookies from config
         const xCookies = await getConfig('X_COOKIES');
         
         try {
+          clearScrapeProgress(input.username);
           const result = await playwrightScrapeUserComments(
             input.username,
             input.maxTweets,
-            xCookies || undefined
+            xCookies || undefined,
+            (p) => setScrapeProgress(input.username, p),
+            undefined,
+            undefined,
+            input.maxRepliesPerTweet
           );
 
           if (!result.success) {
             return { success: false, error: result.error, commentsCount: 0, tweetsCount: 0 };
           }
 
-          // Insert replies into database
           let insertedCount = 0;
+          
+          if (result.tweets) {
+            for (const tweet of result.tweets) {
+              try {
+                await insertRawComment({
+                  replyId: tweet.id,
+                  tweetId: tweet.id,
+                  authorId: 'unknown',
+                  authorName: tweet.authorName,
+                  authorHandle: tweet.authorHandle,
+                  text: tweet.text,
+                  createdAt: new Date(tweet.createdAt),
+                  likeCount: tweet.likeCount,
+                  replyTo: undefined,
+                });
+              } catch (e) {
+                // Ignore duplicates
+              }
+            }
+          }
+
           if (result.replies) {
             for (const reply of result.replies) {
               try {
@@ -774,7 +807,94 @@ ${commentTexts}
             totalScraped: result.replies?.length || 0,
           };
         } catch (error) {
+          setScrapeProgress(input.username, {
+            stage: "error",
+            message: `采集失败: ${String(error)}`,
+            tweetsFound: 0,
+            repliesFound: 0,
+            currentTweet: 0,
+            totalTweets: input.maxTweets,
+            currentAccount: 0,
+            totalAccounts: 1,
+          });
           return { success: false, error: String(error), commentsCount: 0, tweetsCount: 0 };
+        }
+      }),
+
+    // 仅爬取指定 Tweet ID 下全部评论
+    scrapeByTweetId: protectedProcedure
+      .input(z.object({ tweetId: z.string().min(1, "请输入 Tweet ID") }))
+      .mutation(async ({ input }) => {
+        const xCookies = await getConfig('X_COOKIES');
+        const progressKey = `tweet:${input.tweetId}`;
+        try {
+          clearScrapeProgress(progressKey);
+          const onTweet = async (tweet: { id: string; text: string; authorName: string; authorHandle: string; createdAt: string; likeCount: number }) => {
+            try {
+              await insertRawComment({
+                replyId: tweet.id,
+                tweetId: tweet.id,
+                authorId: 'unknown',
+                authorName: tweet.authorName,
+                authorHandle: tweet.authorHandle,
+                text: tweet.text,
+                createdAt: new Date(tweet.createdAt),
+                likeCount: tweet.likeCount,
+                replyTo: undefined,
+              });
+            } catch (err) {
+              /* ignore duplicate */
+            }
+          };
+          const onReply = async (reply: { id: string; text: string; authorId: string; authorName: string; authorHandle: string; createdAt: string; likeCount: number; replyTo: string }) => {
+            try {
+              await insertRawComment({
+                replyId: reply.id,
+                tweetId: reply.replyTo,
+                authorId: reply.authorId,
+                authorName: reply.authorName,
+                authorHandle: reply.authorHandle,
+                text: reply.text,
+                createdAt: new Date(reply.createdAt),
+                likeCount: reply.likeCount,
+                replyTo: reply.replyTo,
+              });
+            } catch (err) {
+              /* ignore duplicate */
+            }
+          };
+          const scrapePromise = scrapeRepliesByTweetId(
+            input.tweetId.trim(),
+            xCookies || undefined,
+            (p) => setScrapeProgress(progressKey, p),
+            onReply,
+            onTweet
+          );
+          const hardTimeoutMs = 10 * 60 * 1000;
+          const hardTimeout = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`采集超时（>${hardTimeoutMs / 1000}s），请稍后重试`)), hardTimeoutMs)
+          );
+          const result = await Promise.race([scrapePromise, hardTimeout]);
+          if (!result.success) {
+            return { success: false, error: result.error || '采集失败', commentsCount: 0 };
+          }
+          return {
+            success: true,
+            commentsCount: result.replies?.length ?? 0,
+            message: `已采集 ${result.replies?.length ?? 0} 条评论，可在此页查看与导出`,
+          };
+        } catch (error: any) {
+          setScrapeProgress(progressKey, {
+            stage: 'error',
+            message: String(error?.message || error),
+            tweetsFound: 0,
+            repliesFound: 0,
+            currentTweet: 0,
+            totalTweets: 1,
+            currentAccount: 0,
+            totalAccounts: 1,
+          });
+          return { success: false, error: String(error?.message || error), commentsCount: 0 };
         }
       }),
 
@@ -782,57 +902,112 @@ ${commentTexts}
     smartFetch: protectedProcedure
       .input(z.object({
         username: z.string(),
-        maxTweets: z.number().min(1).max(50).default(10),
-        maxRepliesPerTweet: z.number().min(1).max(100).default(30),
+        maxTweets: z.number().min(1).max(100).default(30),
+        maxRepliesPerTweet: z.number().min(0).max(300).default(0),
         preferredMethod: z.enum(['playwright', 'apify', 'auto']).default('auto'),
       }))
       .mutation(async ({ input }) => {
         const xCookies = await getConfig('X_COOKIES');
         const apifyToken = await getConfig('APIFY_API_TOKEN');
+        let playwrightError: string | null = null;
 
         // Auto mode: try Playwright first, then Apify
         if (input.preferredMethod === 'auto' || input.preferredMethod === 'playwright') {
           try {
-            const result = await playwrightScrapeUserComments(
+            clearScrapeProgress(input.username);
+            // 边爬边显：先写入根推文再写回复
+            let insertedReplyCount = 0;
+            const onTweet = async (tweet: { id: string; text: string; authorName: string; authorHandle: string; createdAt: string; likeCount: number }) => {
+              try {
+                await insertRawComment({
+                  replyId: tweet.id,
+                  tweetId: tweet.id,
+                  authorId: 'unknown',
+                  authorName: tweet.authorName,
+                  authorHandle: tweet.authorHandle,
+                  text: tweet.text,
+                  createdAt: new Date(tweet.createdAt),
+                  likeCount: tweet.likeCount,
+                  replyTo: undefined,
+                });
+              } catch (err) {
+                // Ignore duplicate errors
+              }
+            };
+            const onReply = async (reply: { id: string; text: string; authorId: string; authorName: string; authorHandle: string; createdAt: string; likeCount: number; replyTo: string }) => {
+              try {
+                await insertRawComment({
+                  replyId: reply.id,
+                  tweetId: reply.replyTo,
+                  authorId: reply.authorId,
+                  authorName: reply.authorName,
+                  authorHandle: reply.authorHandle,
+                  text: reply.text,
+                  createdAt: new Date(reply.createdAt),
+                  likeCount: reply.likeCount,
+                  replyTo: reply.replyTo,
+                });
+                insertedReplyCount++;
+              } catch (err) {
+                // Ignore duplicate errors
+              }
+            };
+            const scrapePromise = playwrightScrapeUserComments(
               input.username,
               input.maxTweets,
-              xCookies || undefined
+              xCookies || undefined,
+              (p) => setScrapeProgress(input.username, p),
+              onReply,
+              onTweet,
+              input.maxRepliesPerTweet
             );
+            // Hard timeout to prevent endless spinner on UI (10 minutes)
+            const hardTimeoutMs = 10 * 60 * 1000;
+            const hardTimeout = new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error(`采集超时（>${hardTimeoutMs / 1000}s），请稍后重试或降低推文数量`)), hardTimeoutMs)
+            );
+            const result = await Promise.race([scrapePromise, hardTimeout]);
 
-            if (result.success && result.replies && result.replies.length > 0) {
-              // Insert replies into database
-              let insertedCount = 0;
-              for (const reply of result.replies) {
-                try {
-                  await insertRawComment({
-                    replyId: reply.id,
-                    tweetId: reply.replyTo,
-                    authorId: reply.authorId,
-                    authorName: reply.authorName,
-                    authorHandle: reply.authorHandle,
-                    text: reply.text,
-                    createdAt: new Date(reply.createdAt),
-                    likeCount: reply.likeCount,
-                    replyTo: reply.replyTo,
-                  });
-                  insertedCount++;
-                } catch (err) {
-                  // Ignore duplicate errors
+            if (result.success) {
+              // Also insert the parent tweets (replies already inserted via onReply)
+              if (result.tweets) {
+                for (const tweet of result.tweets) {
+                  try {
+                    await insertRawComment({
+                      replyId: tweet.id,
+                      tweetId: tweet.id,
+                      authorId: 'unknown',
+                      authorName: tweet.authorName,
+                      authorHandle: tweet.authorHandle,
+                      text: tweet.text,
+                      createdAt: new Date(tweet.createdAt),
+                      likeCount: tweet.likeCount,
+                      replyTo: undefined,
+                    });
+                  } catch (e) {
+                    // Ignore duplicates
+                  }
                 }
               }
 
               return {
                 success: true,
                 method: 'playwright',
-                commentsCount: insertedCount,
+                commentsCount: insertedReplyCount,
                 tweetsCount: result.tweets?.length || 0,
-                message: `使用 Playwright 成功采集 ${insertedCount} 条评论`,
+                message: insertedReplyCount > 0
+                  ? `使用 Playwright 成功采集 ${insertedReplyCount} 条评论`
+                  : `使用 Playwright 完成采集，但未获取到评论`,
               };
             }
 
             // If Playwright failed and we're in auto mode, try Apify
+            if (!result.success) {
+              playwrightError = result.error || 'Playwright 采集失败';
+            }
+
             if (input.preferredMethod === 'auto' && apifyToken) {
-              console.log('Playwright 采集失败，尝试使用 Apify...');
+              console.log(`Playwright 采集失败 (${playwrightError})，尝试使用 Apify...`);
             } else if (!result.success) {
               return {
                 success: false,
@@ -842,6 +1017,17 @@ ${commentTexts}
               };
             }
           } catch (err) {
+            playwrightError = String(err);
+            setScrapeProgress(input.username, {
+              stage: "error",
+              message: `采集失败: ${String(err)}`,
+              tweetsFound: 0,
+              repliesFound: 0,
+              currentTweet: 0,
+              totalTweets: input.maxTweets,
+              currentAccount: 0,
+              totalAccounts: 1,
+            });
             if (input.preferredMethod === 'playwright') {
               return {
                 success: false,
@@ -863,11 +1049,9 @@ ${commentTexts}
             };
           }
 
-          // Use Apify to fetch tweets and their replies
           try {
             console.log(`[Apify] 开始获取 @${input.username} 的推文...`);
             
-            // Step 1: Get user's tweets
             const tweetsResponse = await fetch(
               `https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite/runs?token=${apifyToken}`,
               {
@@ -883,6 +1067,13 @@ ${commentTexts}
 
             if (!tweetsResponse.ok) {
               const errorText = await tweetsResponse.text();
+              if (errorText.includes("Monthly usage hard limit exceeded")) {
+                let errorMsg = "Apify 本月额度已耗尽，无法继续采集。请升级 Apify 套餐或等待下月重置。";
+                if (playwrightError) {
+                  errorMsg += ` (注：Playwright 自爬也失败了: ${playwrightError})`;
+                }
+                return { success: false, method: 'apify', error: errorMsg, commentsCount: 0 };
+              }
               return { success: false, method: 'apify', error: `Apify API 调用失败: ${errorText}`, commentsCount: 0 };
             }
 
@@ -896,13 +1087,12 @@ ${commentTexts}
 
             console.log(`[Apify] 任务已启动, runId: ${runId}, datasetId: ${datasetId}`);
 
-            // Step 2: Wait for the run to complete
             let runStatus = 'RUNNING';
             let attempts = 0;
-            const maxAttempts = 60; // Max 5 minutes wait
+            const maxAttempts = 60;
             
             while (runStatus === 'RUNNING' && attempts < maxAttempts) {
-              await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
+              await new Promise(resolve => setTimeout(resolve, 5000));
               const statusResponse = await fetch(
                 `https://api.apify.com/v2/actor-runs/${runId}?token=${apifyToken}`
               );
@@ -916,7 +1106,6 @@ ${commentTexts}
               return { success: false, method: 'apify', error: `Apify 任务未完成: ${runStatus}`, commentsCount: 0 };
             }
 
-            // Step 3: Get tweets from dataset
             const tweetsDataResponse = await fetch(
               `https://api.apify.com/v2/datasets/${datasetId}/items?token=${apifyToken}`
             );
@@ -927,7 +1116,6 @@ ${commentTexts}
               return { success: false, method: 'apify', error: '未找到该用户的推文', commentsCount: 0 };
             }
 
-            // Step 4: For each tweet, fetch replies using conversation_id
             let totalComments = 0;
             const tweetIds = tweets.slice(0, input.maxTweets).map((t: any) => t.id);
             console.log(`[Apify] 开始获取 ${tweetIds.length} 条推文的评论...`);
@@ -937,7 +1125,6 @@ ${commentTexts}
               try {
                 console.log(`[Apify] 获取推文 ${tweetId} 的评论 (${i + 1}/${tweetIds.length})...`);
                 
-                // Fetch replies for this tweet using conversation_id
                 const repliesResponse = await fetch(
                   `https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite/runs?token=${apifyToken}`,
                   {
@@ -958,7 +1145,6 @@ ${commentTexts}
                 const repliesDatasetId = repliesRun.data?.defaultDatasetId;
                 if (!repliesRunId) continue;
 
-                // Wait for replies run to complete
                 let repliesStatus = 'RUNNING';
                 let repliesAttempts = 0;
                 while (repliesStatus === 'RUNNING' && repliesAttempts < 30) {
@@ -973,16 +1159,14 @@ ${commentTexts}
 
                 if (repliesStatus !== 'SUCCEEDED') continue;
 
-                // Get replies from dataset
                 const repliesDataResponse = await fetch(
                   `https://api.apify.com/v2/datasets/${repliesDatasetId}/items?token=${apifyToken}`
                 );
                 const replies = await repliesDataResponse.json();
                 console.log(`[Apify] 推文 ${tweetId} 获取到 ${replies?.length || 0} 条评论`);
 
-                // Insert replies into database
                 for (const reply of replies) {
-                  if (reply.id === tweetId) continue; // Skip the original tweet
+                  if (reply.id === tweetId) continue;
                   try {
                     await insertRawComment({
                       replyId: reply.id || String(Date.now()) + Math.random(),
@@ -997,7 +1181,6 @@ ${commentTexts}
                     });
                     totalComments++;
                   } catch (err) {
-                    // Ignore duplicate errors
                     console.log(`[Apify] 插入评论失败:`, err);
                   }
                 }

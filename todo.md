@@ -95,3 +95,18 @@
 ## Bug 修复 - Apify 数据同步
 - [x] 排查 Apify 数据未同步到网页的问题
 - [x] 修复数据导入逻辑（添加完整的 Apify 采集流程：获取推文 -> 等待完成 -> 获取评论 -> 导入数据库）
+
+## GitHub 代码同步
+- [x] 从 GitHub 拉取用户本地修改的代码
+- [x] 移植 rootTweetAuthor 过滤功能到 MySQL 版本
+- [x] 移植 scrapeByTweetId（按推文 ID 采集评论）
+- [x] 移植 getScrapeProgress（实时采集进度）
+- [x] 移植 closeBrowser 功能
+- [x] 移植边爬边显功能（250ms 轮询）
+- [x] 移植多账号 Cookie 管理（Settings 页面）
+- [x] 移植 MonitorDashboard 改进（Tweet ID 模式、进度显示）
+- [x] 移植 CommentCard 改进（replyToText 显示）
+- [x] 移植 CookieGuide 教程页面
+- [x] 修复 AnalyticsPanel 方法名引用错误
+- [x] 修复 valueType 类型错误
+- [x] 确保数据库表完整（MySQL schema 保持不变）

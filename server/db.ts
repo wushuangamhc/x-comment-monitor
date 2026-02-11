@@ -1,5 +1,6 @@
-import { eq, desc, asc, and, gte, lte, inArray, like, sql } from "drizzle-orm";
+import { eq, desc, asc, and, gte, lte, inArray, like, sql, isNull, isNotNull } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
+import { alias } from "drizzle-orm/mysql-core";
 import { 
   InsertUser, users, 
   rawComments, InsertRawComment, RawComment,
@@ -24,8 +25,8 @@ export async function getDb() {
 }
 
 // ============ User Functions ============
-export async function upsertUser(user: InsertUser): Promise<void> {
-  if (!user.openId) {
+export async function upsertUser(userData: Partial<InsertUser> & { openId: string }): Promise<void> {
+  if (!userData.openId) {
     throw new Error("User openId is required for upsert");
   }
 
@@ -37,7 +38,7 @@ export async function upsertUser(user: InsertUser): Promise<void> {
 
   try {
     const values: InsertUser = {
-      openId: user.openId,
+      openId: userData.openId,
     };
     const updateSet: Record<string, unknown> = {};
 
@@ -45,7 +46,7 @@ export async function upsertUser(user: InsertUser): Promise<void> {
     type TextField = (typeof textFields)[number];
 
     const assignNullable = (field: TextField) => {
-      const value = user[field];
+      const value = userData[field];
       if (value === undefined) return;
       const normalized = value ?? null;
       values[field] = normalized;
@@ -54,14 +55,14 @@ export async function upsertUser(user: InsertUser): Promise<void> {
 
     textFields.forEach(assignNullable);
 
-    if (user.lastSignedIn !== undefined) {
-      values.lastSignedIn = user.lastSignedIn;
-      updateSet.lastSignedIn = user.lastSignedIn;
+    if (userData.lastSignedIn !== undefined) {
+      values.lastSignedIn = userData.lastSignedIn;
+      updateSet.lastSignedIn = userData.lastSignedIn;
     }
-    if (user.role !== undefined) {
-      values.role = user.role;
-      updateSet.role = user.role;
-    } else if (user.openId === ENV.ownerOpenId) {
+    if (userData.role !== undefined) {
+      values.role = userData.role;
+      updateSet.role = userData.role;
+    } else if (userData.openId === ENV.ownerOpenId) {
       values.role = 'admin';
       updateSet.role = 'admin';
     }
@@ -121,6 +122,7 @@ export async function insertRawComments(comments: InsertRawComment[]): Promise<v
 export interface CommentFilter {
   tweetId?: string;
   authorHandles?: string[];
+  rootTweetAuthor?: string; // Filter for conversation owner
   startTime?: Date;
   endTime?: Date;
   sentiments?: string[];
@@ -129,6 +131,7 @@ export interface CommentFilter {
   sortBy?: 'time_desc' | 'time_asc' | 'value_desc' | 'likes_desc';
   limit?: number;
   offset?: number;
+  analyzed?: boolean;
 }
 
 export async function getCommentsWithAnalysis(filter: CommentFilter) {
@@ -136,6 +139,7 @@ export async function getCommentsWithAnalysis(filter: CommentFilter) {
   if (!db) throw new Error("Database not available");
 
   const conditions = [];
+  const parentTweet = alias(rawComments, "parentTweet");
   
   if (filter.tweetId) {
     conditions.push(eq(rawComments.tweetId, filter.tweetId));
@@ -143,11 +147,37 @@ export async function getCommentsWithAnalysis(filter: CommentFilter) {
   if (filter.authorHandles && filter.authorHandles.length > 0) {
     conditions.push(inArray(rawComments.authorHandle, filter.authorHandles));
   }
+  
+  // Filter by root tweet author
+  const rootTweet = alias(rawComments, "rootTweet");
+  if (filter.rootTweetAuthor) {
+    conditions.push(eq(rootTweet.authorHandle, filter.rootTweetAuthor));
+  }
+
   if (filter.startTime) {
     conditions.push(gte(rawComments.createdAt, filter.startTime));
   }
   if (filter.endTime) {
     conditions.push(lte(rawComments.createdAt, filter.endTime));
+  }
+
+  if (filter.analyzed === true) {
+    conditions.push(isNotNull(analyzedComments.replyId));
+  } else if (filter.analyzed === false) {
+    conditions.push(isNull(analyzedComments.replyId));
+  }
+
+  // Only apply sentiment and score filters if we are NOT explicitly looking for unanalyzed comments
+  if (filter.analyzed !== false) {
+    if (filter.sentiments && filter.sentiments.length > 0) {
+      conditions.push(inArray(analyzedComments.sentiment, filter.sentiments as any));
+    }
+    if (filter.minValueScore !== undefined) {
+      conditions.push(gte(analyzedComments.valueScore, String(filter.minValueScore)));
+    }
+    if (filter.maxValueScore !== undefined) {
+      conditions.push(lte(analyzedComments.valueScore, String(filter.maxValueScore)));
+    }
   }
 
   let query = db
@@ -162,6 +192,7 @@ export async function getCommentsWithAnalysis(filter: CommentFilter) {
       createdAt: rawComments.createdAt,
       likeCount: rawComments.likeCount,
       replyTo: rawComments.replyTo,
+      replyToText: parentTweet.text, // Fetch parent tweet text
       sentiment: analyzedComments.sentiment,
       valueScore: analyzedComments.valueScore,
       valueType: analyzedComments.valueType,
@@ -169,55 +200,56 @@ export async function getCommentsWithAnalysis(filter: CommentFilter) {
       analyzedAt: analyzedComments.analyzedAt,
     })
     .from(rawComments)
-    .leftJoin(analyzedComments, eq(rawComments.replyId, analyzedComments.replyId));
+    .leftJoin(analyzedComments, eq(rawComments.replyId, analyzedComments.replyId))
+    .leftJoin(parentTweet, eq(rawComments.replyTo, parentTweet.replyId));
+
+  // Only join rootTweet if we are filtering by it to avoid unnecessary overhead
+  if (filter.rootTweetAuthor) {
+    query = query.leftJoin(rootTweet, eq(rawComments.tweetId, rootTweet.replyId)) as typeof query;
+  }
 
   if (conditions.length > 0) {
     query = query.where(and(...conditions)) as typeof query;
   }
 
-  // Apply sentiment and value score filters after join
-  let results = await query;
-  
-  if (filter.sentiments && filter.sentiments.length > 0) {
-    results = results.filter(r => r.sentiment && filter.sentiments!.includes(r.sentiment));
-  }
-  if (filter.minValueScore !== undefined) {
-    results = results.filter(r => r.valueScore && parseFloat(r.valueScore) >= filter.minValueScore!);
-  }
-  if (filter.maxValueScore !== undefined) {
-    results = results.filter(r => r.valueScore && parseFloat(r.valueScore) <= filter.maxValueScore!);
-  }
-
-  // Sort
+  // SQL Sort
   const sortBy = filter.sortBy || 'time_desc';
-  results.sort((a, b) => {
-    switch (sortBy) {
-      case 'time_desc':
-        return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-      case 'time_asc':
-        return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
-      case 'value_desc':
-        return (parseFloat(b.valueScore || '0') - parseFloat(a.valueScore || '0'));
-      case 'likes_desc':
-        return b.likeCount - a.likeCount;
-      default:
-        return 0;
-    }
-  });
+  switch (sortBy) {
+    case 'time_desc':
+      query = query.orderBy(desc(rawComments.createdAt)) as typeof query;
+      break;
+    case 'time_asc':
+      query = query.orderBy(asc(rawComments.createdAt)) as typeof query;
+      break;
+    case 'value_desc':
+      query = query.orderBy(desc(analyzedComments.valueScore)) as typeof query;
+      break;
+    case 'likes_desc':
+      query = query.orderBy(desc(rawComments.likeCount)) as typeof query;
+      break;
+    default:
+      query = query.orderBy(desc(rawComments.createdAt)) as typeof query;
+  }
 
-  // Pagination
+  // SQL Pagination
   const offset = filter.offset || 0;
   const limit = filter.limit || 50;
-  return results.slice(offset, offset + limit);
+  
+  query = query.limit(limit).offset(offset) as typeof query;
+
+  return await query;
 }
 
-export async function getCommentStats(tweetId?: string) {
+export async function getCommentStats(tweetId?: string, rootTweetAuthor?: string) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
 
-  const conditions = tweetId ? [eq(rawComments.tweetId, tweetId)] : [];
+  const rootTweet = alias(rawComments, "rootTweet");
+  const conditions = [];
+  if (tweetId) conditions.push(eq(rawComments.tweetId, tweetId));
+  if (rootTweetAuthor) conditions.push(eq(rootTweet.authorHandle, rootTweetAuthor));
 
-  const query = db
+  let query = db
     .select({
       sentiment: analyzedComments.sentiment,
       valueScore: analyzedComments.valueScore,
@@ -226,8 +258,11 @@ export async function getCommentStats(tweetId?: string) {
     .from(rawComments)
     .leftJoin(analyzedComments, eq(rawComments.replyId, analyzedComments.replyId));
 
+  if (rootTweetAuthor) {
+    query = query.leftJoin(rootTweet, eq(rawComments.tweetId, rootTweet.replyId)) as typeof query;
+  }
   if (conditions.length > 0) {
-    return await (query.where(and(...conditions)) as typeof query);
+    query = query.where(and(...conditions)) as typeof query;
   }
   return await query;
 }
@@ -236,8 +271,6 @@ export async function getUnanalyzedComments(limit: number = 10) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
 
-  const analyzed = db.select({ replyId: analyzedComments.replyId }).from(analyzedComments);
-  
   return await db
     .select()
     .from(rawComments)
@@ -359,15 +392,37 @@ export async function getAllCommentsForExport(filter?: CommentFilter) {
   if (!db) throw new Error("Database not available");
 
   const conditions = [];
-  
+  const rootTweet = alias(rawComments, "rootTweet");
+
   if (filter?.tweetId) {
     conditions.push(eq(rawComments.tweetId, filter.tweetId));
+  }
+  if (filter?.rootTweetAuthor) {
+    conditions.push(eq(rootTweet.authorHandle, filter.rootTweetAuthor));
   }
   if (filter?.startTime) {
     conditions.push(gte(rawComments.createdAt, filter.startTime));
   }
   if (filter?.endTime) {
     conditions.push(lte(rawComments.createdAt, filter.endTime));
+  }
+
+  if (filter?.analyzed === true) {
+    conditions.push(isNotNull(analyzedComments.replyId));
+  } else if (filter?.analyzed === false) {
+    conditions.push(isNull(analyzedComments.replyId));
+  }
+
+  if (filter?.analyzed !== false) {
+    if (filter?.sentiments && filter.sentiments.length > 0) {
+      conditions.push(inArray(analyzedComments.sentiment, filter.sentiments as any));
+    }
+    if (filter?.minValueScore !== undefined) {
+      conditions.push(gte(analyzedComments.valueScore, String(filter.minValueScore)));
+    }
+    if (filter?.maxValueScore !== undefined) {
+      conditions.push(lte(analyzedComments.valueScore, String(filter.maxValueScore)));
+    }
   }
 
   let query = db
@@ -390,14 +445,14 @@ export async function getAllCommentsForExport(filter?: CommentFilter) {
     .from(rawComments)
     .leftJoin(analyzedComments, eq(rawComments.replyId, analyzedComments.replyId));
 
+  if (filter?.rootTweetAuthor) {
+    query = query.leftJoin(rootTweet, eq(rawComments.tweetId, rootTweet.replyId)) as typeof query;
+  }
   if (conditions.length > 0) {
     query = query.where(and(...conditions)) as typeof query;
   }
 
-  const results = await query;
-  
-  // Sort by time desc
-  results.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  
-  return results;
+  query = query.orderBy(desc(rawComments.createdAt)) as typeof query;
+
+  return await query;
 }
