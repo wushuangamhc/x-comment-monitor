@@ -1,5 +1,6 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { getConfig } from './db';
+import { ensurePlaywrightChromium } from './ensurePlaywright';
 
 // Helper to add timeout to promises
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
@@ -258,6 +259,12 @@ async function getBrowser(): Promise<Browser> {
     try {
       console.log('[Playwright] Launching browser...');
 
+      // Step 0: Ensure Chromium is installed (auto-install if missing)
+      const chromiumReady = await ensurePlaywrightChromium();
+      if (!chromiumReady) {
+        throw new Error('Chromium 浏览器自动安装失败，请联系管理员手动安装 (npx playwright install chromium)');
+      }
+
       // Proxy: 优先使用应用内配置（设置页），其次环境变量 .env
       const configProxy = await getConfig('PLAYWRIGHT_PROXY');
       const proxyServer = (configProxy?.trim() || '') || process.env.HTTPS_PROXY || process.env.ALL_PROXY || process.env.http_proxy || process.env.https_proxy;
@@ -292,7 +299,7 @@ async function getBrowser(): Promise<Browser> {
       
     } catch (launchError: any) {
       console.error('[Playwright] Launch failed:', launchError.message);
-      throw new Error(`Playwright 浏览器启动失败: ${launchError.message}。请确保已安装浏览器 (npx playwright install chromium)`);
+      throw new Error(`浏览器启动失败: ${launchError.message}`);
     }
   }
   return browserInstance;

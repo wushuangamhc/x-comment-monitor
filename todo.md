@@ -110,3 +110,13 @@
 - [x] 修复 AnalyticsPanel 方法名引用错误
 - [x] 修复 valueType 类型错误
 - [x] 确保数据库表完整（MySQL schema 保持不变）
+
+## Bug 修复 - 线上环境 Playwright 不可用
+- [x] 添加 Playwright 浏览器可用性检测
+- [x] 线上环境自动安装 Chromium（不再降级，而是自动修复）
+- [x] 安装失败时给出明确错误提示
+
+## 线上环境 Playwright 支持
+- [x] 创建 Chromium 自动检测与安装脚本 (ensurePlaywright.ts)
+- [x] 在服务器启动流程中集成自动安装 (start 脚本 + 运行时检测)
+- [x] twitterScraper 中添加启动前检测逻辑 (getBrowser 函数)
