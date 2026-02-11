@@ -304,50 +304,57 @@ function findChromiumPath(): string | undefined {
 
 async function getBrowser(): Promise<Browser> {
   if (!browserInstance || !browserInstance.isConnected()) {
+    // Proxy: 优先使用应用内配置（设置页），其次环境变量 .env
+    const configProxy = await getConfig('PLAYWRIGHT_PROXY');
+    const proxyServer = (configProxy?.trim() || '') || process.env.HTTPS_PROXY || process.env.ALL_PROXY || process.env.http_proxy || process.env.https_proxy;
+
+    const baseArgs = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--disable-gpu',
+      '--ignore-certificate-errors',
+    ];
+
+    // Strategy 1: Use system Chromium with explicit executablePath
+    const systemPath = findChromiumPath();
+    if (systemPath) {
+      try {
+        console.log(`[Playwright] Trying system Chromium: ${systemPath}`);
+        const opts: any = { headless: true, executablePath: systemPath, args: baseArgs };
+        if (proxyServer) { opts.proxy = { server: proxyServer }; }
+        browserInstance = await withTimeout(chromium.launch(opts), 30000, 'System Chromium launch timed out');
+        console.log('[Playwright] System Chromium launch successful');
+        return browserInstance;
+      } catch (e: any) {
+        console.warn(`[Playwright] System Chromium failed: ${e.message}`);
+      }
+    }
+
+    // Strategy 2: Use Playwright channel='chromium' (uses system-installed chromium)
     try {
-      console.log('[Playwright] Launching browser...');
+      console.log('[Playwright] Trying channel=chromium...');
+      const opts: any = { headless: true, channel: 'chromium', args: baseArgs };
+      if (proxyServer) { opts.proxy = { server: proxyServer }; }
+      browserInstance = await withTimeout(chromium.launch(opts), 30000, 'Channel chromium launch timed out');
+      console.log('[Playwright] Channel chromium launch successful');
+      return browserInstance;
+    } catch (e: any) {
+      console.warn(`[Playwright] Channel chromium failed: ${e.message}`);
+    }
 
-      // Proxy: 优先使用应用内配置（设置页），其次环境变量 .env
-      const configProxy = await getConfig('PLAYWRIGHT_PROXY');
-      const proxyServer = (configProxy?.trim() || '') || process.env.HTTPS_PROXY || process.env.ALL_PROXY || process.env.http_proxy || process.env.https_proxy;
-      
-      const executablePath = findChromiumPath();
-      console.log(`[Playwright] Using executable: ${executablePath || 'Playwright default'}`);
-
-      const launchOptions: any = {
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--disable-gpu',
-          '--ignore-certificate-errors',
-        ],
-      };
-
-      if (executablePath) {
-        launchOptions.executablePath = executablePath;
-      }
-
-      if (proxyServer) {
-        console.log(`[Playwright] Using proxy: ${proxyServer}`);
-        launchOptions.proxy = { server: proxyServer };
-      } else {
-        console.log('[Playwright] No proxy configured, attempting direct connection');
-      }
-
-      console.log('[Playwright] Attempting launch...');
-      browserInstance = await withTimeout(
-        chromium.launch(launchOptions),
-        30000,
-        "Browser launch timed out after 30s"
-      );
-      console.log('[Playwright] Launch successful');
-      
-    } catch (launchError: any) {
-      console.error('[Playwright] Launch failed:', launchError.message);
-      throw new Error(`浏览器启动失败: ${launchError.message}`);
+    // Strategy 3: Playwright default (its own bundled browser)
+    try {
+      console.log('[Playwright] Trying Playwright default...');
+      const opts: any = { headless: true, args: baseArgs };
+      if (proxyServer) { opts.proxy = { server: proxyServer }; }
+      browserInstance = await withTimeout(chromium.launch(opts), 30000, 'Default launch timed out');
+      console.log('[Playwright] Default launch successful');
+      return browserInstance;
+    } catch (e: any) {
+      console.error(`[Playwright] All strategies failed. Last error: ${e.message}`);
+      throw new Error(`浏览器启动失败: 所有启动方式均失败。系统 Chromium: ${systemPath || '未找到'}. 错误: ${e.message}`);
     }
   }
   return browserInstance;
