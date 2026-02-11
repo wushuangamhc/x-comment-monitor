@@ -125,3 +125,9 @@
 - [x] 移除 start 脚本中阻塞式 playwright install
 - [x] 改用系统自带 Chromium (/usr/bin/chromium-browser)
 - [x] 后台异步检测 + 自动发现系统浏览器
+
+## GitHub 代码同步（第二次 - Puppeteer 迁移）
+- [x] 拉取 GitHub 最新代码（用户本地 Puppeteer 迁移）
+- [x] 同步业务文件到 Manus 项目（保持 MySQL 兼容）
+- [x] 验证构建和运行正常
+- [x] 保存 checkpoint 并发布

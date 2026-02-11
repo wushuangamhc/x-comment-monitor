@@ -12,6 +12,46 @@ import { ENV } from './_core/env';
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
+// Local dev fallback when DATABASE_URL is not configured.
+const devConfigStore = new Map<
+  string,
+  { id: number; value: string; description: string | null; updatedAt: Date }
+>();
+let devConfigSeq = 1;
+
+const devMonitorStore: MonitorTarget[] = [];
+let devMonitorSeq = 1;
+
+type DevRawCommentRow = {
+  id: number;
+  replyId: string;
+  tweetId: string;
+  authorId: string;
+  authorName: string;
+  authorHandle: string;
+  text: string;
+  createdAt: Date;
+  likeCount: number;
+  replyTo: string | null;
+  fetchedAt: Date;
+};
+
+type DevAnalyzedRow = {
+  id: number;
+  replyId: string;
+  sentiment: "positive" | "neutral" | "negative" | "anger" | "sarcasm";
+  valueScore: string;
+  valueType: string[];
+  summary: string;
+  analyzedAt: Date;
+};
+
+const devRawCommentStore: DevRawCommentRow[] = [];
+let devRawCommentSeq = 1;
+
+const devAnalyzedStore = new Map<string, DevAnalyzedRow>();
+let devAnalyzedSeq = 1;
+
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
@@ -99,7 +139,32 @@ export async function getUserByOpenId(openId: string) {
 // ============ Raw Comments Functions ============
 export async function insertRawComment(comment: InsertRawComment): Promise<void> {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    if (process.env.NODE_ENV === "development") {
+      const existing = devRawCommentStore.find((c) => c.replyId === comment.replyId);
+      if (existing) {
+        existing.likeCount = comment.likeCount ?? existing.likeCount;
+        existing.fetchedAt = new Date();
+        return;
+      }
+
+      devRawCommentStore.push({
+        id: devRawCommentSeq++,
+        replyId: comment.replyId,
+        tweetId: comment.tweetId,
+        authorId: comment.authorId,
+        authorName: comment.authorName,
+        authorHandle: comment.authorHandle,
+        text: comment.text,
+        createdAt: comment.createdAt,
+        likeCount: comment.likeCount ?? 0,
+        replyTo: comment.replyTo ?? null,
+        fetchedAt: new Date(),
+      });
+      return;
+    }
+    throw new Error("Database not available");
+  }
   
   await db.insert(rawComments).values(comment).onDuplicateKeyUpdate({
     set: {
@@ -111,7 +176,14 @@ export async function insertRawComment(comment: InsertRawComment): Promise<void>
 
 export async function insertRawComments(comments: InsertRawComment[]): Promise<void> {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    if (process.env.NODE_ENV !== "development") throw new Error("Database not available");
+    if (comments.length === 0) return;
+    for (const comment of comments) {
+      await insertRawComment(comment);
+    }
+    return;
+  }
   if (comments.length === 0) return;
   
   for (const comment of comments) {
@@ -136,7 +208,79 @@ export interface CommentFilter {
 
 export async function getCommentsWithAnalysis(filter: CommentFilter) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    if (process.env.NODE_ENV !== "development") throw new Error("Database not available");
+
+    const rootAuthorByTweetId = new Map<string, string>();
+    for (const c of devRawCommentStore) {
+      if (c.replyId === c.tweetId) rootAuthorByTweetId.set(c.tweetId, c.authorHandle);
+    }
+
+    let rows = devRawCommentStore.map((raw) => {
+      const analysis = devAnalyzedStore.get(raw.replyId);
+      const parent = raw.replyTo
+        ? devRawCommentStore.find((p) => p.replyId === raw.replyTo)
+        : undefined;
+
+      return {
+        id: raw.id,
+        replyId: raw.replyId,
+        tweetId: raw.tweetId,
+        authorId: raw.authorId,
+        authorName: raw.authorName,
+        authorHandle: raw.authorHandle,
+        text: raw.text,
+        createdAt: raw.createdAt,
+        likeCount: raw.likeCount,
+        replyTo: raw.replyTo,
+        replyToText: parent?.text ?? null,
+        sentiment: analysis?.sentiment ?? null,
+        valueScore: analysis?.valueScore ?? null,
+        valueType: analysis?.valueType ?? null,
+        summary: analysis?.summary ?? null,
+        analyzedAt: analysis?.analyzedAt ?? null,
+      };
+    });
+
+    if (filter.tweetId) rows = rows.filter((r) => r.tweetId === filter.tweetId);
+    if (filter.authorHandles && filter.authorHandles.length > 0) {
+      const set = new Set(filter.authorHandles);
+      rows = rows.filter((r) => set.has(r.authorHandle));
+    }
+    if (filter.rootTweetAuthor) {
+      rows = rows.filter((r) => rootAuthorByTweetId.get(r.tweetId) === filter.rootTweetAuthor);
+    }
+    if (filter.startTime) rows = rows.filter((r) => r.createdAt >= filter.startTime!);
+    if (filter.endTime) rows = rows.filter((r) => r.createdAt <= filter.endTime!);
+
+    if (filter.analyzed === true) rows = rows.filter((r) => r.sentiment !== null);
+    if (filter.analyzed === false) rows = rows.filter((r) => r.sentiment === null);
+
+    if (filter.analyzed !== false) {
+      if (filter.sentiments && filter.sentiments.length > 0) {
+        const s = new Set(filter.sentiments);
+        rows = rows.filter((r) => r.sentiment && s.has(r.sentiment));
+      }
+      if (filter.minValueScore !== undefined) {
+        rows = rows.filter((r) => Number(r.valueScore ?? -1) >= filter.minValueScore!);
+      }
+      if (filter.maxValueScore !== undefined) {
+        rows = rows.filter((r) => Number(r.valueScore ?? 2) <= filter.maxValueScore!);
+      }
+    }
+
+    const sortBy = filter.sortBy || "time_desc";
+    rows.sort((a, b) => {
+      if (sortBy === "time_asc") return a.createdAt.getTime() - b.createdAt.getTime();
+      if (sortBy === "value_desc") return Number(b.valueScore ?? -1) - Number(a.valueScore ?? -1);
+      if (sortBy === "likes_desc") return (b.likeCount ?? 0) - (a.likeCount ?? 0);
+      return b.createdAt.getTime() - a.createdAt.getTime();
+    });
+
+    const offset = filter.offset || 0;
+    const limit = filter.limit || 50;
+    return rows.slice(offset, offset + limit);
+  }
 
   const conditions = [];
   const parentTweet = alias(rawComments, "parentTweet");
@@ -242,7 +386,29 @@ export async function getCommentsWithAnalysis(filter: CommentFilter) {
 
 export async function getCommentStats(tweetId?: string, rootTweetAuthor?: string) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    if (process.env.NODE_ENV !== "development") throw new Error("Database not available");
+
+    const rootAuthorByTweetId = new Map<string, string>();
+    for (const c of devRawCommentStore) {
+      if (c.replyId === c.tweetId) rootAuthorByTweetId.set(c.tweetId, c.authorHandle);
+    }
+
+    let rows = devRawCommentStore;
+    if (tweetId) rows = rows.filter((r) => r.tweetId === tweetId);
+    if (rootTweetAuthor) {
+      rows = rows.filter((r) => rootAuthorByTweetId.get(r.tweetId) === rootTweetAuthor);
+    }
+
+    return rows.map((r) => {
+      const analysis = devAnalyzedStore.get(r.replyId);
+      return {
+        sentiment: analysis?.sentiment ?? null,
+        valueScore: analysis?.valueScore ?? null,
+        createdAt: r.createdAt,
+      };
+    });
+  }
 
   const rootTweet = alias(rawComments, "rootTweet");
   const conditions = [];
@@ -269,7 +435,13 @@ export async function getCommentStats(tweetId?: string, rootTweetAuthor?: string
 
 export async function getUnanalyzedComments(limit: number = 10) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    if (process.env.NODE_ENV !== "development") throw new Error("Database not available");
+    return devRawCommentStore
+      .filter((r) => !devAnalyzedStore.has(r.replyId))
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, limit);
+  }
 
   return await db
     .select()
@@ -280,7 +452,28 @@ export async function getUnanalyzedComments(limit: number = 10) {
 
 export async function getTopCommenters(tweetId?: string, limit: number = 10) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    if (process.env.NODE_ENV !== "development") throw new Error("Database not available");
+
+    const counts = new Map<string, { authorHandle: string; authorName: string; count: number }>();
+    for (const r of devRawCommentStore) {
+      if (tweetId && r.tweetId !== tweetId) continue;
+      const current = counts.get(r.authorHandle);
+      if (current) {
+        current.count += 1;
+      } else {
+        counts.set(r.authorHandle, {
+          authorHandle: r.authorHandle,
+          authorName: r.authorName,
+          count: 1,
+        });
+      }
+    }
+
+    return Array.from(counts.values())
+      .sort((a, b) => b.count - a.count)
+      .slice(0, limit);
+  }
 
   const conditions = tweetId ? [eq(rawComments.tweetId, tweetId)] : [];
 
@@ -305,7 +498,21 @@ export async function getTopCommenters(tweetId?: string, limit: number = 10) {
 // ============ Analyzed Comments Functions ============
 export async function insertAnalyzedComment(analysis: InsertAnalyzedComment): Promise<void> {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    if (process.env.NODE_ENV !== "development") throw new Error("Database not available");
+    const existing = devAnalyzedStore.get(analysis.replyId);
+    const row: DevAnalyzedRow = {
+      id: existing?.id ?? devAnalyzedSeq++,
+      replyId: analysis.replyId,
+      sentiment: analysis.sentiment,
+      valueScore: String(analysis.valueScore),
+      valueType: Array.isArray(analysis.valueType) ? analysis.valueType : [],
+      summary: analysis.summary,
+      analyzedAt: new Date(),
+    };
+    devAnalyzedStore.set(analysis.replyId, row);
+    return;
+  }
   
   await db.insert(analyzedComments).values(analysis).onDuplicateKeyUpdate({
     set: {
@@ -321,45 +528,103 @@ export async function insertAnalyzedComment(analysis: InsertAnalyzedComment): Pr
 // ============ Monitor Targets Functions ============
 export async function getActiveMonitorTargets() {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  
+  if (!db) {
+    if (process.env.NODE_ENV === "development") {
+      return devMonitorStore.filter((m) => m.isActive === 1);
+    }
+    throw new Error("Database not available");
+  }
+
   return await db.select().from(monitorTargets).where(eq(monitorTargets.isActive, 1));
 }
 
 export async function insertMonitorTarget(target: InsertMonitorTarget): Promise<void> {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  
+  if (!db) {
+    if (process.env.NODE_ENV === "development") {
+      const now = new Date();
+      devMonitorStore.push({
+        id: devMonitorSeq++,
+        type: target.type,
+        targetId: target.targetId,
+        targetName: target.targetName ?? null,
+        targetHandle: target.targetHandle ?? null,
+        isActive: target.isActive ?? 1,
+        lastFetchedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      return;
+    }
+    throw new Error("Database not available");
+  }
+
   await db.insert(monitorTargets).values(target);
 }
 
 export async function updateMonitorTarget(id: number, updates: Partial<InsertMonitorTarget>): Promise<void> {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  
+  if (!db) {
+    if (process.env.NODE_ENV === "development") {
+      const idx = devMonitorStore.findIndex((m) => m.id === id);
+      if (idx < 0) return;
+      devMonitorStore[idx] = {
+        ...devMonitorStore[idx],
+        ...updates,
+        updatedAt: new Date(),
+      };
+      return;
+    }
+    throw new Error("Database not available");
+  }
+
   await db.update(monitorTargets).set(updates).where(eq(monitorTargets.id, id));
 }
 
 export async function deleteMonitorTarget(id: number): Promise<void> {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  
+  if (!db) {
+    if (process.env.NODE_ENV === "development") {
+      const idx = devMonitorStore.findIndex((m) => m.id === id);
+      if (idx >= 0) devMonitorStore.splice(idx, 1);
+      return;
+    }
+    throw new Error("Database not available");
+  }
+
   await db.delete(monitorTargets).where(eq(monitorTargets.id, id));
 }
 
 // ============ System Config Functions ============
 export async function getConfig(key: string): Promise<string | null> {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  
+  if (!db) {
+    if (process.env.NODE_ENV === "development") {
+      return devConfigStore.get(key)?.value ?? null;
+    }
+    throw new Error("Database not available");
+  }
+
   const result = await db.select().from(systemConfig).where(eq(systemConfig.configKey, key)).limit(1);
   return result.length > 0 ? result[0].configValue : null;
 }
 
 export async function setConfig(key: string, value: string, description?: string): Promise<void> {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  
+  if (!db) {
+    if (process.env.NODE_ENV === "development") {
+      const current = devConfigStore.get(key);
+      devConfigStore.set(key, {
+        id: current?.id ?? devConfigSeq++,
+        value,
+        description: description ?? current?.description ?? null,
+        updatedAt: new Date(),
+      });
+      return;
+    }
+    throw new Error("Database not available");
+  }
+
   await db.insert(systemConfig).values({
     configKey: key,
     configValue: value,
@@ -374,22 +639,71 @@ export async function setConfig(key: string, value: string, description?: string
 
 export async function getAllConfigs(): Promise<SystemConfig[]> {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  
+  if (!db) {
+    if (process.env.NODE_ENV === "development") {
+      return Array.from(devConfigStore.entries()).map(([configKey, cfg]) => ({
+        id: cfg.id,
+        configKey,
+        configValue: cfg.value,
+        description: cfg.description,
+        updatedAt: cfg.updatedAt,
+      }));
+    }
+    throw new Error("Database not available");
+  }
+
   return await db.select().from(systemConfig);
 }
 
 export async function deleteConfig(key: string): Promise<void> {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  
+  if (!db) {
+    if (process.env.NODE_ENV === "development") {
+      devConfigStore.delete(key);
+      return;
+    }
+    throw new Error("Database not available");
+  }
+
   await db.delete(systemConfig).where(eq(systemConfig.configKey, key));
 }
 
 // ============ Export Functions ============
 export async function getAllCommentsForExport(filter?: CommentFilter) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    if (process.env.NODE_ENV !== "development") throw new Error("Database not available");
+    const list = await getCommentsWithAnalysis({
+      tweetId: filter?.tweetId,
+      rootTweetAuthor: filter?.rootTweetAuthor,
+      startTime: filter?.startTime,
+      endTime: filter?.endTime,
+      sentiments: filter?.sentiments,
+      minValueScore: filter?.minValueScore,
+      maxValueScore: filter?.maxValueScore,
+      analyzed: filter?.analyzed,
+      sortBy: "time_desc",
+      limit: Number.MAX_SAFE_INTEGER,
+      offset: 0,
+    });
+
+    return list.map((r: any) => ({
+      replyId: r.replyId,
+      tweetId: r.tweetId,
+      authorId: r.authorId,
+      authorName: r.authorName,
+      authorHandle: r.authorHandle,
+      text: r.text,
+      createdAt: r.createdAt,
+      likeCount: r.likeCount,
+      replyTo: r.replyTo,
+      sentiment: r.sentiment,
+      valueScore: r.valueScore,
+      valueType: r.valueType,
+      summary: r.summary,
+      analyzedAt: r.analyzedAt,
+    }));
+  }
 
   const conditions = [];
   const rootTweet = alias(rawComments, "rootTweet");

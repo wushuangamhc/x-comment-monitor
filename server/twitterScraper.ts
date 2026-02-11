@@ -1,8 +1,24 @@
-import { chromium, Browser, BrowserContext, Page } from 'playwright';
+import puppeteer from 'puppeteer-core';
+import chromium from '@sparticuz/chromium';
 import { getConfig } from './db';
-import { execSync } from 'child_process';
-import fs from 'fs';
+import type { Browser, Page, BrowserContext as PuppeteerBrowserContext, ElementHandle } from 'puppeteer-core';
+import fs from 'node:fs';
 
+async function elGetAttribute(handle: ElementHandle<Element> | null, name: string): Promise<string | null> {
+  if (!handle) return null;
+  return handle.evaluate((el, attr) => (el as HTMLElement).getAttribute(attr), name);
+}
+async function elTextContent(handle: ElementHandle<Element> | null): Promise<string> {
+  if (!handle) return '';
+  return (await handle.evaluate((el) => (el as HTMLElement).textContent)) ?? '';
+}
+
+
+/** Context-like wrapper: creates pages with viewport/cookies set (Puppeteer has no context options). */
+export interface ScraperContext {
+  newPage(): Promise<Page>;
+  close(): Promise<void>;
+}
 
 // Helper to add timeout to promises
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
@@ -16,7 +32,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
 async function gotoWithRetry(
   page: Page,
   url: string,
-  options: { waitUntil?: 'domcontentloaded' | 'load' | 'commit'; timeout?: number } = {},
+  options: { waitUntil?: 'domcontentloaded' | 'load'; timeout?: number } = {},
   maxAttempts = 3
 ): Promise<void> {
   const { waitUntil = 'domcontentloaded', timeout = 45000 } = options;
@@ -198,57 +214,67 @@ async function wait(baseDelay: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, delay));
 }
 
-// Helper to find the Y position of the "More tweets" / recommendation divider
+/** Puppeteer: click first element matching selector whose text matches regex. */
+async function clickByText(page: Page, selector: string, textPattern: string, flags = 'i'): Promise<boolean> {
+  const handle = await page.evaluateHandle((sel, patternStr, f) => {
+    const re = new RegExp(patternStr, f);
+    const nodes = document.querySelectorAll(sel);
+    for (const el of Array.from(nodes)) {
+      if (re.test((el.textContent || '').trim())) return el;
+    }
+    return null;
+  }, selector, textPattern, flags);
+  try {
+    const el = handle.asElement() as import('puppeteer-core').ElementHandle<Element> | null;
+    if (!el) return false;
+    await el.click();
+    return true;
+  } finally {
+    await handle.dispose().catch(() => {});
+  }
+}
+
+// Helper to find the Y position of the "More tweets" / recommendation divider (Puppeteer: no text selectors, use evaluate)
 async function getCutoffY(page: Page): Promise<number> {
   try {
-    const primaryColumn = await page.$('[data-testid="primaryColumn"]');
-    if (!primaryColumn) return Infinity;
-
-    // Match common headers for recommendations (English, Chinese, and variants)
-    // Anchored to avoid matching "Show more replies"
-    const patterns = [
-      'text=/^(More tweets|Discover more|You might like|更多推文|发现更多|推荐内容)$/i',
-      'text=/^(Recommended for you|Recommended|For you|Trending|Who to follow|关注)$/i',
-    ];
-    for (const selector of patterns) {
-      try {
-        const cutoffHeader = await primaryColumn.$(selector);
-        if (cutoffHeader) {
-          const box = await cutoffHeader.boundingBox();
-          if (box) return box.y;
+    const y = await page.evaluate(() => {
+      const primary = document.querySelector('[data-testid="primaryColumn"]');
+      if (!primary) return Infinity;
+      const texts = [
+        'More tweets', 'Discover more', 'You might like', '更多推文', '发现更多', '推荐内容',
+        'Recommended for you', 'Recommended', 'For you', 'Trending', 'Who to follow', '关注',
+      ];
+      const walk = (el: Element): number => {
+        const t = (el.textContent || '').trim();
+        if (texts.some(txt => t === txt || t.toLowerCase().includes('recommended') || t.includes('推荐'))) {
+          const r = el.getBoundingClientRect();
+          return r.top + window.scrollY;
         }
-      } catch (_) {
-        continue;
-      }
-    }
-
-    // Structure fallback: block that contains "Recommended" text or Follow-style CTA
-    try {
-      const recommendedBlock = await primaryColumn.$('text=/Recommended|推荐/i');
-      if (recommendedBlock) {
-        const box = await recommendedBlock.boundingBox();
-        if (box) return box.y;
-      }
-    } catch (_) {
-      // ignore
-    }
-  } catch (e) {
-    // Ignore errors and continue scraping if cutoff not found
+        for (const c of Array.from(el.children)) {
+          const y = walk(c);
+          if (y !== Infinity) return y;
+        }
+        return Infinity;
+      };
+      return walk(primary);
+    });
+    return typeof y === 'number' ? y : Infinity;
+  } catch {
+    return Infinity;
   }
-  return Infinity;
 }
 
 // 检测推文/回复中的图片、视频，返回占位文本 [图片][视频]
-async function getMediaPlaceholders(articleEl: { $: (selector: string) => Promise<{ dispose?: () => Promise<void> } | null> }): Promise<string> {
+async function getMediaPlaceholders(articleEl: import('puppeteer-core').ElementHandle): Promise<string> {
   let s = '';
   try {
     const photo = await articleEl.$('[data-testid="tweetPhoto"]');
-    if (photo) { s += ' [图片]'; (photo as any).dispose?.(); }
+    if (photo) { s += ' [图片]'; }
     const videoPlayer = await articleEl.$('[data-testid="videoPlayer"]');
-    if (videoPlayer) { s += ' [视频]'; (videoPlayer as any).dispose?.(); }
+    if (videoPlayer) { s += ' [视频]'; }
     if (!s.includes('[视频]')) {
       const videoTag = await articleEl.$('video');
-      if (videoTag) { s += ' [视频]'; (videoTag as any).dispose?.(); }
+      if (videoTag) { s += ' [视频]'; }
     }
   } catch (_) { /* ignore */ }
   return s;
@@ -256,158 +282,161 @@ async function getMediaPlaceholders(articleEl: { $: (selector: string) => Promis
 
 let browserInstance: Browser | null = null;
 
-/**
- * Find a usable Chromium executable path.
- * Priority: env var > system chromium-browser > system chromium > system google-chrome > Playwright default
- */
-function findChromiumPath(): string | undefined {
-  // 1. Explicit env var override
-  if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
-    return process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+function findLocalChromePath(): string | undefined {
+  if (process.env.CHROME_EXECUTABLE_PATH) {
+    return process.env.CHROME_EXECUTABLE_PATH;
   }
 
-  // 2. Check common system paths
-  const candidates = [
-    '/usr/bin/chromium-browser',
-    '/usr/bin/chromium',
-    '/usr/bin/google-chrome-stable',
-    '/usr/bin/google-chrome',
-    '/usr/lib/chromium-browser/chromium-browser',
-  ];
+  const candidates =
+    process.platform === 'win32'
+      ? [
+          'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+          'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+          'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+          'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+        ]
+      : process.platform === 'darwin'
+      ? [
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        ]
+      : [
+          '/usr/bin/google-chrome',
+          '/usr/bin/google-chrome-stable',
+          '/usr/bin/chromium',
+          '/usr/bin/chromium-browser',
+          '/usr/bin/microsoft-edge',
+        ];
 
-  for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate)) {
-        console.log(`[Playwright] Found system browser at: ${candidate}`);
-        return candidate;
-      }
-    } catch {
-      continue;
-    }
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
   }
-
-  // 3. Try `which` command
-  try {
-    const result = execSync('which chromium-browser chromium google-chrome 2>/dev/null', { encoding: 'utf8' }).trim();
-    const firstLine = result.split('\n')[0]?.trim();
-    if (firstLine) {
-      console.log(`[Playwright] Found browser via which: ${firstLine}`);
-      return firstLine;
-    }
-  } catch {
-    // not found
-  }
-
-  // 4. Return undefined to let Playwright use its own bundled browser
   return undefined;
 }
 
+/** Launch browser using @sparticuz/chromium (works in serverless/slim containers). */
 async function getBrowser(): Promise<Browser> {
-  if (!browserInstance || !browserInstance.isConnected()) {
-    // Proxy: 优先使用应用内配置（设置页），其次环境变量 .env
+  if (!browserInstance || !browserInstance.connected) {
     const configProxy = await getConfig('PLAYWRIGHT_PROXY');
     const proxyServer = (configProxy?.trim() || '') || process.env.HTTPS_PROXY || process.env.ALL_PROXY || process.env.http_proxy || process.env.https_proxy;
+    const useSparticuz = process.env.NODE_ENV === 'production' && process.platform === 'linux';
+    const launchCandidates: Array<{ label: string; opts: Parameters<typeof puppeteer.launch>[0] }> = [];
 
-    const baseArgs = [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--disable-gpu',
-      '--ignore-certificate-errors',
-    ];
+    if (useSparticuz) {
+      launchCandidates.push({
+        label: '@sparticuz/chromium',
+        opts: {
+          args: chromium.args,
+          defaultViewport: chromium.defaultViewport,
+          executablePath: await chromium.executablePath(),
+          headless: chromium.headless,
+        },
+      });
+    }
 
-    // Strategy 1: Use system Chromium with explicit executablePath
-    const systemPath = findChromiumPath();
-    if (systemPath) {
+    const localPath = findLocalChromePath();
+    if (localPath) {
+      launchCandidates.push({
+        label: `local browser (${localPath})`,
+        opts: {
+          executablePath: localPath,
+          headless: true,
+          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        },
+      });
+    } else if (!useSparticuz) {
+      launchCandidates.push({
+        label: 'chrome channel',
+        opts: {
+          channel: 'chrome',
+          headless: true,
+          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        },
+      });
+    }
+
+    if (launchCandidates.length === 0) {
+      throw new Error('No browser candidate found. Please set CHROME_EXECUTABLE_PATH.');
+    }
+
+    let lastError: unknown = null;
+    for (const candidate of launchCandidates) {
       try {
-        console.log(`[Playwright] Trying system Chromium: ${systemPath}`);
-        const opts: any = { headless: true, executablePath: systemPath, args: baseArgs };
-        if (proxyServer) { opts.proxy = { server: proxyServer }; }
-        browserInstance = await withTimeout(chromium.launch(opts), 30000, 'System Chromium launch timed out');
-        console.log('[Playwright] System Chromium launch successful');
-        return browserInstance;
-      } catch (e: any) {
-        console.warn(`[Playwright] System Chromium failed: ${e.message}`);
+        const opts = { ...candidate.opts };
+        if (proxyServer) (opts as any).args = [...(opts.args || []), `--proxy-server=${proxyServer}`];
+        console.log(`[Scraper] Launching browser with ${candidate.label}...`);
+        browserInstance = await withTimeout(puppeteer.launch(opts), 30000, 'Browser launch timed out');
+        console.log(`[Scraper] Browser launched successfully via ${candidate.label}`);
+        break;
+      } catch (error) {
+        lastError = error;
+        console.warn(`[Scraper] Browser launch failed via ${candidate.label}:`, error);
       }
     }
 
-    // Strategy 2: Use Playwright channel='chromium' (uses system-installed chromium)
-    try {
-      console.log('[Playwright] Trying channel=chromium...');
-      const opts: any = { headless: true, channel: 'chromium', args: baseArgs };
-      if (proxyServer) { opts.proxy = { server: proxyServer }; }
-      browserInstance = await withTimeout(chromium.launch(opts), 30000, 'Channel chromium launch timed out');
-      console.log('[Playwright] Channel chromium launch successful');
-      return browserInstance;
-    } catch (e: any) {
-      console.warn(`[Playwright] Channel chromium failed: ${e.message}`);
-    }
-
-    // Strategy 3: Playwright default (its own bundled browser)
-    try {
-      console.log('[Playwright] Trying Playwright default...');
-      const opts: any = { headless: true, args: baseArgs };
-      if (proxyServer) { opts.proxy = { server: proxyServer }; }
-      browserInstance = await withTimeout(chromium.launch(opts), 30000, 'Default launch timed out');
-      console.log('[Playwright] Default launch successful');
-      return browserInstance;
-    } catch (e: any) {
-      console.error(`[Playwright] All strategies failed. Last error: ${e.message}`);
-      throw new Error(`浏览器启动失败: 所有启动方式均失败。系统 Chromium: ${systemPath || '未找到'}. 错误: ${e.message}`);
+    if (!browserInstance) {
+      throw new Error(`Browser launch failed for all candidates: ${String((lastError as any)?.message || lastError)}`);
     }
   }
   return browserInstance;
 }
 
-async function createContext(cookies?: string): Promise<BrowserContext> {
-  console.log('[Playwright] Creating context...');
+async function createContext(cookies?: string): Promise<ScraperContext> {
+  console.log('[Scraper] Creating context...');
   const browser = await getBrowser();
 
-  // 每次创建 context 时都带上当前代理（与 getBrowser 同源：设置页 > 环境变量），
-  // 这样即使用户先做了 Tweet ID 采集再设代理、或浏览器是早前无代理启动的，新 context 也会走代理
+  const userAgent = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+  ][Math.floor(Math.random() * 3)];
+  const viewport = { width: 1280 + Math.floor(Math.random() * 200), height: 800 + Math.floor(Math.random() * 100) };
+
   const configProxy = await getConfig('PLAYWRIGHT_PROXY');
   const proxyServer = (configProxy?.trim() || '') || process.env.HTTPS_PROXY || process.env.ALL_PROXY || process.env.http_proxy || process.env.https_proxy;
-  const contextOptions: Parameters<Browser['newContext']>[0] = {
-    userAgent: [
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    ][Math.floor(Math.random() * 3)],
-    viewport: { width: 1280 + Math.floor(Math.random() * 200), height: 800 + Math.floor(Math.random() * 100) },
-    locale: 'en-US',
-    ignoreHTTPSErrors: true,
-  };
-  if (proxyServer) {
-    contextOptions.proxy = { server: proxyServer };
-    console.log('[Playwright] Context using proxy:', proxyServer);
-  }
+  if (proxyServer) console.log('[Scraper] Context using proxy:', proxyServer);
 
-  console.log('[Playwright] Opening new context...');
-  const context = await withTimeout(
-    browser.newContext(contextOptions),
+  const rawContext = await withTimeout(
+    browser.createBrowserContext(),
     30000,
-    "Context creation timed out after 30s"
+    'Context creation timed out after 30s'
   );
-  console.log('[Playwright] Context created successfully');
+  const ctx = rawContext as PuppeteerBrowserContext;
 
+  const cookieList: Array<{ name: string; value: string; domain?: string; path?: string }> = [];
   if (cookies) {
     try {
       const cookieArray = JSON.parse(cookies);
       if (Array.isArray(cookieArray)) {
-        await context.addCookies(cookieArray.map((c: any) => ({
-          name: c.name,
-          value: c.value,
-          domain: c.domain || '.x.com',
-          path: c.path || '/',
-        })));
+        for (const c of cookieArray) {
+          cookieList.push({
+            name: c.name,
+            value: c.value,
+            domain: c.domain || '.x.com',
+            path: c.path || '/',
+          });
+        }
       }
     } catch (e) {
       console.error('[Scraper] Failed to parse cookies:', e);
     }
   }
 
-  return context;
+  const wrapper: ScraperContext = {
+    async newPage() {
+      const page = await ctx.newPage();
+      await page.setViewport(viewport);
+      await page.setUserAgent(userAgent);
+      await page.setBypassCSP(true);
+      if (cookieList.length) await page.setCookie(...cookieList);
+      return page;
+    },
+    async close() {
+      await ctx.close();
+    },
+  };
+  console.log('[Scraper] Context created successfully');
+  return wrapper;
 }
 
 // 进度回调类型
@@ -454,7 +483,7 @@ export async function scrapeUserComments(
     return { success: false, error: '用户名不能为空', progress };
   }
 
-  let context: BrowserContext | null = null;
+  let context: ScraperContext | null = null;
   let page: Page | null = null;
 
   try {
@@ -528,12 +557,11 @@ export async function scrapeUserComments(
     await wait(currentConfig.pageLoadDelay);
 
     // 检查是否需要登录
-    // Use a more specific selector and wait briefly to ensure it's not a false positive
     try {
         const loginButton = await page.waitForSelector('a[href*="/login"]', { timeout: 3000 }).catch(() => null);
-        
-        // Also check for the "Sign in to X" text which often appears in the modal
-        const signInText = await page.$('text="Sign in to X"').catch(() => null);
+        const signInText = await page.evaluate(() =>
+          Array.from(document.querySelectorAll('*')).some(el => (el.textContent || '').trim() === 'Sign in to X')
+        ).catch(() => false);
         
         if ((loginButton || signInText) && !useCookies) {
           console.warn('[Scraper] Login required detected');
@@ -580,7 +608,7 @@ export async function scrapeUserComments(
           }
 
           const tweetLink = await el.$('a[href*="/status/"]');
-          const href = await tweetLink?.getAttribute('href');
+          const href = await elGetAttribute(tweetLink ?? null, 'href');
           const tweetId = href?.match(/status\/(\d+)/)?.[1];
           
           if (!tweetId) {
@@ -593,13 +621,13 @@ export async function scrapeUserComments(
           }
 
           const textEl = await el.$('[data-testid="tweetText"]');
-          let text = await textEl?.textContent() || '';
+          let text = await elTextContent(textEl ?? null) || '';
           // 无正文时用卡片标题占位
           if (!text.trim()) {
              const card = await el.$('[data-testid="card.wrapper"]');
              if (card) {
                  const cardTitleEl = await card.$('div[dir="auto"][style*="color: rgb(15, 20, 25)"], span');
-                 const cardTitle = await cardTitleEl?.textContent();
+                 const cardTitle = await elTextContent(cardTitleEl ?? null);
                  if (cardTitle) text = `[链接] ${cardTitle.slice(0, 50)}`;
                  else text = '[链接]';
              }
@@ -607,11 +635,11 @@ export async function scrapeUserComments(
           text = text.trim() + (await getMediaPlaceholders(el));
 
           const authorEl = await el.$('[data-testid="User-Name"]');
-          const authorText = await authorEl?.textContent() || '';
+          const authorText = await elTextContent(authorEl ?? null) || '';
           const authorMatch = authorText.match(/(.+?)@(\w+)/);
           
           const timeEl = await el.$('time');
-          const datetime = await timeEl?.getAttribute('datetime') || new Date().toISOString();
+          const datetime = (await elGetAttribute(timeEl ?? null, 'datetime')) || new Date().toISOString();
           
           // 获取互动数据
           const likeEl = await el.$('[data-testid="like"] span');
@@ -631,9 +659,9 @@ export async function scrapeUserComments(
             authorName: authorMatch?.[1]?.trim() || username,
             authorHandle: authorMatch?.[2] || username,
             createdAt: datetime,
-            likeCount: parseCount(await likeEl?.textContent()),
-            replyCount: parseCount(await replyEl?.textContent()),
-            retweetCount: parseCount(await retweetEl?.textContent()),
+            likeCount: parseCount(await elTextContent(likeEl ?? null)),
+            replyCount: parseCount(await elTextContent(replyEl ?? null)),
+            retweetCount: parseCount(await elTextContent(retweetEl ?? null)),
           });
 
           updateProgress({ 
@@ -696,11 +724,9 @@ export async function scrapeUserComments(
         
         await wait(currentConfig.pageLoadDelay);
 
-        // 优先切换到「最新」回复，否则 X 默认「最热」只显示部分评论
+        // 优先切换到「最新」回复
         try {
-          const latestTab = page.locator('a[role="tab"]').filter({ hasText: /Latest|最新/i }).first();
-          if ((await latestTab.count()) > 0) {
-            await latestTab.click();
+          if (await clickByText(page, 'a[role="tab"]', 'Latest|最新')) {
             await wait(2000);
             console.log('[Scraper] Switched to Latest replies.');
           }
@@ -732,21 +758,21 @@ export async function scrapeUserComments(
               }
 
               const replyLink = await el.$('a[href*="/status/"]');
-              const href = await replyLink?.getAttribute('href');
+              const href = await elGetAttribute(replyLink ?? null, 'href');
               const replyId = href?.match(/status\/(\d+)/)?.[1];
               
               // 跳过原推文
               if (!replyId || replyId === tweet.id || allReplies.some(r => r.id === replyId)) continue;
 
               const textEl = await el.$('[data-testid="tweetText"]');
-              let text = (await textEl?.textContent() || '').trim() + (await getMediaPlaceholders(el));
+              let text = (await elTextContent(textEl ?? null) || '').trim() + (await getMediaPlaceholders(el));
 
               const authorEl = await el.$('[data-testid="User-Name"]');
-              const authorText = await authorEl?.textContent() || '';
+              const authorText = await elTextContent(authorEl ?? null) || '';
               const authorMatch = authorText.match(/(.+?)@(\w+)/);
               
               const timeEl = await el.$('time');
-              const datetime = await timeEl?.getAttribute('datetime') || new Date().toISOString();
+              const datetime = (await elGetAttribute(timeEl ?? null, 'datetime')) || new Date().toISOString();
               
               const likeEl = await el.$('[data-testid="like"] span');
               const parseCount = (text: string | null | undefined): number => {
@@ -756,7 +782,7 @@ export async function scrapeUserComments(
                 return parseInt(num) || 0;
               };
 
-              const replyLikeCount = parseCount(await likeEl?.textContent());
+              const replyLikeCount = parseCount(await elTextContent(likeEl ?? null));
 
               const reply: Reply = {
                 id: replyId,
@@ -806,12 +832,11 @@ export async function scrapeUserComments(
 
           // Try to find "Show more replies" button
           try {
-            const showMoreBtn = await page.$('div[role="button"]:has-text("Show more replies"), div[role="button"]:has-text("显示更多回复"), div[role="button"]:has-text("Show probable spam")');
-            if (showMoreBtn && await showMoreBtn.isVisible()) {
+            const clicked = await clickByText(page, 'div[role="button"]', 'Show more replies|显示更多回复|Show probable spam');
+            if (clicked) {
               console.log('[Scraper] Clicking "Show more replies" button...');
-              await showMoreBtn.click();
               await wait(2000);
-              scrollBudget += 20; // 点击「更多」后多给一些滚动预算
+              scrollBudget += 20;
             }
           } catch (e) {
             // Ignore button errors
@@ -881,7 +906,7 @@ export async function scrapeRepliesByTweetId(
     Object.assign(progress, updates);
     onProgress?.(progress);
   };
-  let context: BrowserContext | null = null;
+  let context: ScraperContext | null = null;
   let page: Page | null = null;
 
   try {
@@ -943,24 +968,24 @@ export async function scrapeRepliesByTweetId(
     }
     const first = articles[0];
     const tweetLink = await first.$('a[href*="/status/"]');
-    const href = await tweetLink?.getAttribute('href');
+    const href = await elGetAttribute(tweetLink ?? null, 'href');
     const parsedId = href?.match(/status\/(\d+)/)?.[1] || tweetId;
     const textEl = await first.$('[data-testid="tweetText"]');
-    let text = await textEl?.textContent() || '';
+    let text = await elTextContent(textEl ?? null) || '';
     if (!text.trim()) {
       const card = await first.$('[data-testid="card.wrapper"]');
       if (card) {
         const cardTitleEl = await card.$('div[dir="auto"], span');
-        const cardTitle = await cardTitleEl?.textContent();
+        const cardTitle = await elTextContent(cardTitleEl ?? null);
         text = cardTitle ? `[链接] ${cardTitle.slice(0, 50)}` : '[链接]';
       }
     }
     text = text.trim() + (await getMediaPlaceholders(first));
     const authorEl = await first.$('[data-testid="User-Name"]');
-    const authorText = await authorEl?.textContent() || '';
+    const authorText = await elTextContent(authorEl ?? null) || '';
     const authorMatch = authorText.match(/(.+?)@(\w+)/);
     const timeEl = await first.$('time');
-    const datetime = await timeEl?.getAttribute('datetime') || new Date().toISOString();
+    const datetime = (await elGetAttribute(timeEl ?? null, 'datetime')) || new Date().toISOString();
     const likeEl = await first.$('[data-testid="like"] span');
     const replyEl = await first.$('[data-testid="reply"] span');
     const retweetEl = await first.$('[data-testid="retweet"] span');
@@ -976,9 +1001,9 @@ export async function scrapeRepliesByTweetId(
       authorName: authorMatch?.[1]?.trim() || 'Unknown',
       authorHandle: authorMatch?.[2] || 'unknown',
       createdAt: datetime,
-      likeCount: parseCount(await likeEl?.textContent()),
-      replyCount: parseCount(await replyEl?.textContent()),
-      retweetCount: parseCount(await retweetEl?.textContent()),
+      likeCount: parseCount(await elTextContent(likeEl ?? null)),
+      replyCount: parseCount(await elTextContent(replyEl ?? null)),
+      retweetCount: parseCount(await elTextContent(retweetEl ?? null)),
     };
     if (onTweet) {
       try { await Promise.resolve(onTweet(rootTweet)); } catch (e) { console.error('[Scraper] onTweet error:', e); }
@@ -986,11 +1011,7 @@ export async function scrapeRepliesByTweetId(
 
     updateProgress({ stage: 'fetching_replies', message: '正在获取该推文下全部评论...' });
     try {
-      const latestTab = page.locator('a[role="tab"]').filter({ hasText: /Latest|最新/i }).first();
-      if ((await latestTab.count()) > 0) {
-        await latestTab.click();
-        await wait(2000);
-      }
+      if (await clickByText(page, 'a[role="tab"]', 'Latest|最新')) await wait(2000);
     } catch (_) {}
 
     const allReplies: Reply[] = [];
@@ -1004,18 +1025,18 @@ export async function scrapeRepliesByTweetId(
           const box = await el.boundingBox();
           if (box && box.y > cutoffY) break;
           const replyLink = await el.$('a[href*="/status/"]');
-          const hrefR = await replyLink?.getAttribute('href');
+          const hrefR = await elGetAttribute(replyLink ?? null, 'href');
           const replyId = hrefR?.match(/status\/(\d+)/)?.[1];
           if (!replyId || seenReplyIds.has(replyId)) continue;
 
           seenReplyIds.add(replyId);
           const textElR = await el.$('[data-testid="tweetText"]');
-          let textR = (await textElR?.textContent() || '').trim() + (await getMediaPlaceholders(el));
+          let textR = (await elTextContent(textElR ?? null) || '').trim() + (await getMediaPlaceholders(el));
           const authorElR = await el.$('[data-testid="User-Name"]');
-          const authorTextR = await authorElR?.textContent() || '';
+          const authorTextR = await elTextContent(authorElR ?? null) || '';
           const authorMatchR = authorTextR.match(/(.+?)@(\w+)/);
           const timeElR = await el.$('time');
-          const datetimeR = await timeElR?.getAttribute('datetime') || new Date().toISOString();
+          const datetimeR = (await elGetAttribute(timeElR ?? null, 'datetime')) || new Date().toISOString();
           const likeElR = await el.$('[data-testid="like"] span');
           const parseCountR = (t: string | null | undefined): number => {
             if (!t) return 0;
@@ -1030,7 +1051,7 @@ export async function scrapeRepliesByTweetId(
             authorName: authorMatchR?.[1]?.trim() || 'Unknown',
             authorHandle: authorMatchR?.[2] || 'unknown',
             createdAt: datetimeR,
-            likeCount: parseCountR(await likeElR?.textContent()),
+            likeCount: parseCountR(await elTextContent(likeElR ?? null)),
             replyTo: rootTweet.id,
           };
           allReplies.push(reply);
@@ -1067,14 +1088,11 @@ export async function scrapeRepliesByTweetId(
         consecutiveScrollsWithNoNew = 0;
       }
 
-      // 尽量点光所有「显示更多」类按钮（多语言、多种文案）
+      // 尽量点光所有「显示更多」类按钮
       for (let i = 0; i < 8; i++) {
         try {
-          const showMore = page.locator('div[role="button"]').filter({ hasText: /Show more|显示更多|more replies|更多回复|View more|Load more|See more|probable spam|可能为垃圾/i }).first();
-          if ((await showMore.count()) > 0 && await showMore.isVisible()) {
-            await showMore.scrollIntoViewIfNeeded();
-            await wait(600);
-            await showMore.click();
+          const pattern = 'Show more|显示更多|more replies|更多回复|View more|Load more|See more|probable spam|可能为垃圾';
+          if (await clickByText(page, 'div[role="button"]', pattern)) {
             await wait(4000);
             scrollBudget += 20;
             consecutiveScrollsWithNoNew = 0;
@@ -1085,7 +1103,7 @@ export async function scrapeRepliesByTweetId(
       const articles = await page.$$('article[data-testid="tweet"]');
       if (articles.length > 0) {
         try {
-          await articles[articles.length - 1].scrollIntoViewIfNeeded();
+          await articles[articles.length - 1].evaluate((el) => el.scrollIntoView());
           await wait(1500);
         } catch (_) {}
       }
