@@ -1,5 +1,7 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { getConfig } from './db';
+import { execSync } from 'child_process';
+import fs from 'fs';
 
 
 // Helper to add timeout to promises
@@ -265,7 +267,6 @@ function findChromiumPath(): string | undefined {
   }
 
   // 2. Check common system paths
-  const { execSync } = require('child_process');
   const candidates = [
     '/usr/bin/chromium-browser',
     '/usr/bin/chromium',
@@ -276,7 +277,6 @@ function findChromiumPath(): string | undefined {
 
   for (const candidate of candidates) {
     try {
-      const fs = require('fs');
       if (fs.existsSync(candidate)) {
         console.log(`[Playwright] Found system browser at: ${candidate}`);
         return candidate;
