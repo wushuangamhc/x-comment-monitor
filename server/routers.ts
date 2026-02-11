@@ -39,6 +39,7 @@ import {
   type ScrapeProgress,
 } from "./twitterScraper";
 import { clearScrapeProgress, getScrapeProgress, setScrapeProgress } from "./scrapeProgressStore";
+import { getPlaywrightStatus } from "./ensurePlaywright";
 
 // Sentiment types
 const sentimentEnum = z.enum(["positive", "neutral", "negative", "anger", "sarcasm"]);
@@ -452,6 +453,11 @@ ${commentTexts}
         await deleteConfig(input.key);
         return { success: true };
       }),
+
+    // Playwright 状态查询
+    getPlaywrightStatus: protectedProcedure.query(() => {
+      return getPlaywrightStatus();
+    }),
 
     // 爬取频率配置
     getScrapeConfig: protectedProcedure.query(() => {

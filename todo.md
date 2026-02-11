@@ -120,3 +120,8 @@
 - [x] 创建 Chromium 自动检测与安装脚本 (ensurePlaywright.ts)
 - [x] 在服务器启动流程中集成自动安装 (start 脚本 + 运行时检测)
 - [x] twitterScraper 中添加启动前检测逻辑 (getBrowser 函数)
+
+## Bug 修复 - 线上 Service Unavailable
+- [x] 移除 start 脚本中阻塞式 playwright install
+- [x] 改用系统自带 Chromium (/usr/bin/chromium-browser)
+- [x] 后台异步检测 + 自动发现系统浏览器

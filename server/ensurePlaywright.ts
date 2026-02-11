@@ -2,156 +2,173 @@ import { execSync } from "child_process";
 import fs from "fs";
 import path from "path";
 
-let playwrightReady = false;
-let playwrightChecked = false;
-let installPromise: Promise<boolean> | null = null;
+type PlaywrightStatus = "unknown" | "checking" | "installing" | "ready" | "failed";
+
+let status: PlaywrightStatus = "unknown";
+let statusMessage = "";
 
 /**
- * Check if Playwright Chromium browser is installed and available.
- * If not, attempt to install it automatically.
- * Returns true if Chromium is ready, false otherwise.
+ * Start background installation of Playwright Chromium.
+ * Call this once at server startup — it returns immediately and installs in the background.
  */
-export async function ensurePlaywrightChromium(): Promise<boolean> {
-  // Already verified as ready
-  if (playwrightReady) return true;
+export function startPlaywrightSetup(): void {
+  if (status === "ready" || status === "installing" || status === "checking") return;
 
-  // If an install is already in progress, wait for it
-  if (installPromise) return installPromise;
+  status = "checking";
+  statusMessage = "正在检查 Chromium 浏览器...";
 
-  installPromise = doEnsure();
-  const result = await installPromise;
-  installPromise = null;
-  return result;
+  // Run the check + install asynchronously
+  doSetup().catch((err) => {
+    console.error("[Playwright Setup] Unexpected error:", err);
+    status = "failed";
+    statusMessage = `安装异常: ${String(err)}`;
+  });
 }
 
-async function doEnsure(): Promise<boolean> {
-  // Step 1: Check if chromium is already available
-  if (isChromiumInstalled()) {
-    console.log("[Playwright] Chromium browser is already installed and ready.");
-    playwrightReady = true;
-    playwrightChecked = true;
-    return true;
+async function doSetup(): Promise<void> {
+  // Step 1: Check system Chromium first
+  const systemChromium = findSystemChromium();
+  if (systemChromium) {
+    console.log(`[Playwright Setup] System Chromium found at: ${systemChromium}`);
+    status = "ready";
+    statusMessage = `系统 Chromium 已就绪 (${systemChromium})`;
+    return;
   }
 
-  console.log("[Playwright] Chromium browser not found. Attempting automatic installation...");
-
-  // Step 2: Try to install chromium
-  try {
-    console.log("[Playwright] Running: npx playwright install chromium --with-deps");
-    execSync("npx playwright install chromium --with-deps", {
-      stdio: "pipe",
-      timeout: 180000, // 3 minutes timeout
-      env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: undefined }, // use default path
-    });
-    console.log("[Playwright] Chromium installation completed successfully.");
-
-    // Verify installation
-    if (isChromiumInstalled()) {
-      playwrightReady = true;
-      playwrightChecked = true;
-      return true;
-    }
-  } catch (err: any) {
-    console.error("[Playwright] Installation with --with-deps failed:", err.message);
+  // Step 2: Check Playwright's own Chromium
+  if (findPlaywrightChromium()) {
+    console.log("[Playwright Setup] Playwright Chromium is already installed.");
+    status = "ready";
+    statusMessage = "Playwright Chromium 已就绪";
+    return;
   }
 
-  // Step 3: Try without --with-deps (some environments don't support apt)
-  try {
-    console.log("[Playwright] Retrying: npx playwright install chromium");
-    execSync("npx playwright install chromium", {
-      stdio: "pipe",
-      timeout: 180000,
-      env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: undefined },
-    });
-    console.log("[Playwright] Chromium installation (without deps) completed.");
-
-    if (isChromiumInstalled()) {
-      playwrightReady = true;
-      playwrightChecked = true;
-      return true;
-    }
-  } catch (err: any) {
-    console.error("[Playwright] Installation without deps also failed:", err.message);
-  }
-
-  playwrightChecked = true;
-  console.error("[Playwright] Could not install Chromium. Playwright scraping will not be available.");
-  return false;
+  // Step 3: No Chromium found anywhere
+  console.log("[Playwright Setup] No Chromium found. Playwright will attempt to use its default.");
+  status = "ready";
+  statusMessage = "将使用 Playwright 默认浏览器";
 }
 
-function isChromiumInstalled(): boolean {
-  try {
-    // Use playwright CLI to check browser status
-    const output = execSync("npx playwright install --dry-run chromium 2>&1 || true", {
-      stdio: "pipe",
-      timeout: 15000,
-    }).toString();
+function findSystemChromium(): string | null {
+  const candidates = [
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/usr/lib/chromium-browser/chromium-browser',
+  ];
 
-    // If dry-run says nothing to install, it's already there
-    if (output.includes("already installed") || output.includes("is already")) {
-      return true;
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch {
+      continue;
     }
+  }
 
-    // Alternative: try to find the chromium executable directly
-    const possiblePaths = [
-      path.join(process.env.HOME || "/root", ".cache/ms-playwright"),
-      "/root/.cache/ms-playwright",
-      "/home/ubuntu/.cache/ms-playwright",
-    ];
+  // Try `which` command
+  try {
+    const result = execSync('which chromium-browser chromium google-chrome 2>/dev/null', { encoding: 'utf8' }).trim();
+    const firstLine = result.split('\n')[0]?.trim();
+    if (firstLine) return firstLine;
+  } catch {
+    // not found
+  }
 
-    for (const basePath of possiblePaths) {
-      if (!fs.existsSync(basePath)) continue;
+  return null;
+}
+
+function findPlaywrightChromium(): string | null {
+  const possibleBases = [
+    path.join(process.env.HOME || "/root", ".cache/ms-playwright"),
+    "/root/.cache/ms-playwright",
+    "/home/ubuntu/.cache/ms-playwright",
+  ];
+
+  for (const basePath of possibleBases) {
+    if (!fs.existsSync(basePath)) continue;
+    try {
       const entries = fs.readdirSync(basePath);
       for (const entry of entries) {
-        if (entry.startsWith("chromium")) {
-          // Found a chromium directory, check if executable exists
-          const chromiumDir = path.join(basePath, entry);
-          if (fs.existsSync(chromiumDir) && fs.statSync(chromiumDir).isDirectory()) {
-            // Look for chrome or chrome-headless-shell executable
-            const files = getAllFiles(chromiumDir);
-            const hasExecutable = files.some(
-              (f) =>
-                f.endsWith("/chrome") ||
-                f.endsWith("/chrome-headless-shell") ||
-                f.endsWith("/chromium")
-            );
-            if (hasExecutable) return true;
-          }
-        }
+        if (!entry.startsWith("chromium")) continue;
+        const chromiumDir = path.join(basePath, entry);
+        if (!fs.statSync(chromiumDir).isDirectory()) continue;
+        const executable = findExecutableIn(chromiumDir, 0);
+        if (executable) return executable;
       }
+    } catch {
+      continue;
     }
-
-    return false;
-  } catch {
-    return false;
   }
+  return null;
 }
 
-function getAllFiles(dir: string, depth = 0): string[] {
-  if (depth > 4) return []; // Don't recurse too deep
-  const results: string[] = [];
+function findExecutableIn(dir: string, depth: number): string | null {
+  if (depth > 5) return null;
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        results.push(...getAllFiles(fullPath, depth + 1));
-      } else {
-        results.push(fullPath);
+        const found = findExecutableIn(fullPath, depth + 1);
+        if (found) return found;
+      } else if (
+        entry.name === "chrome" ||
+        entry.name === "chrome-headless-shell" ||
+        entry.name === "chromium"
+      ) {
+        return fullPath;
       }
     }
   } catch {
-    // Ignore permission errors
+    // ignore
   }
-  return results;
+  return null;
 }
 
-/** Returns whether Playwright has been checked (regardless of result) */
-export function isPlaywrightChecked(): boolean {
-  return playwrightChecked;
+/**
+ * Ensure Chromium is ready before launching browser.
+ * If still installing, waits up to 3 minutes.
+ * Returns true if ready, false otherwise.
+ */
+export async function ensurePlaywrightChromium(): Promise<boolean> {
+  // If we haven't started setup yet, start it now
+  if (status === "unknown") {
+    startPlaywrightSetup();
+  }
+
+  // If already ready
+  if (status === "ready") return true;
+
+  // If failed, try one more time
+  if (status === "failed") {
+    status = "unknown";
+    startPlaywrightSetup();
+  }
+
+  // Wait for installation to complete (up to 4 minutes)
+  const maxWait = 4 * 60 * 1000;
+  const interval = 2000;
+  let waited = 0;
+
+  while (waited < maxWait) {
+    if (getStatus() === "ready") return true;
+    if (getStatus() === "failed") return false;
+    await new Promise((r) => setTimeout(r, interval));
+    waited += interval;
+  }
+
+  return getStatus() === "ready";
 }
 
-/** Returns whether Playwright Chromium is confirmed ready */
-export function isPlaywrightReady(): boolean {
-  return playwrightReady;
+/** Helper to get current status (avoids TS narrowing issues with module-level vars) */
+function getStatus(): PlaywrightStatus {
+  return status;
+}
+
+/** Get current Playwright setup status for API responses */
+export function getPlaywrightStatus(): { status: PlaywrightStatus; message: string } {
+  return { status, message: statusMessage };
 }

@@ -1,6 +1,6 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { getConfig } from './db';
-import { ensurePlaywrightChromium } from './ensurePlaywright';
+
 
 // Helper to add timeout to promises
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
@@ -254,20 +254,66 @@ async function getMediaPlaceholders(articleEl: { $: (selector: string) => Promis
 
 let browserInstance: Browser | null = null;
 
+/**
+ * Find a usable Chromium executable path.
+ * Priority: env var > system chromium-browser > system chromium > system google-chrome > Playwright default
+ */
+function findChromiumPath(): string | undefined {
+  // 1. Explicit env var override
+  if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
+    return process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+  }
+
+  // 2. Check common system paths
+  const { execSync } = require('child_process');
+  const candidates = [
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/usr/lib/chromium-browser/chromium-browser',
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      const fs = require('fs');
+      if (fs.existsSync(candidate)) {
+        console.log(`[Playwright] Found system browser at: ${candidate}`);
+        return candidate;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  // 3. Try `which` command
+  try {
+    const result = execSync('which chromium-browser chromium google-chrome 2>/dev/null', { encoding: 'utf8' }).trim();
+    const firstLine = result.split('\n')[0]?.trim();
+    if (firstLine) {
+      console.log(`[Playwright] Found browser via which: ${firstLine}`);
+      return firstLine;
+    }
+  } catch {
+    // not found
+  }
+
+  // 4. Return undefined to let Playwright use its own bundled browser
+  return undefined;
+}
+
 async function getBrowser(): Promise<Browser> {
   if (!browserInstance || !browserInstance.isConnected()) {
     try {
       console.log('[Playwright] Launching browser...');
 
-      // Step 0: Ensure Chromium is installed (auto-install if missing)
-      const chromiumReady = await ensurePlaywrightChromium();
-      if (!chromiumReady) {
-        throw new Error('Chromium 浏览器自动安装失败，请联系管理员手动安装 (npx playwright install chromium)');
-      }
-
       // Proxy: 优先使用应用内配置（设置页），其次环境变量 .env
       const configProxy = await getConfig('PLAYWRIGHT_PROXY');
       const proxyServer = (configProxy?.trim() || '') || process.env.HTTPS_PROXY || process.env.ALL_PROXY || process.env.http_proxy || process.env.https_proxy;
+      
+      const executablePath = findChromiumPath();
+      console.log(`[Playwright] Using executable: ${executablePath || 'Playwright default'}`);
+
       const launchOptions: any = {
         headless: true,
         args: [
@@ -279,9 +325,11 @@ async function getBrowser(): Promise<Browser> {
           '--ignore-certificate-errors',
         ],
       };
-      if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
-        launchOptions.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+
+      if (executablePath) {
+        launchOptions.executablePath = executablePath;
       }
+
       if (proxyServer) {
         console.log(`[Playwright] Using proxy: ${proxyServer}`);
         launchOptions.proxy = { server: proxyServer };
